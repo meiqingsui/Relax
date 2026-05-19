@@ -14,6 +14,14 @@ import ray
 import requests
 import torch
 import torch.distributed as dist
+
+try:
+    # NPU patch
+    import mindspeed.megatron_adaptor
+    from mindspeed.megatron_adaptor import repatch
+except ImportError:
+    repatch = None
+    
 import transfer_queue as tq
 from megatron.core import mpu
 from tensordict import TensorDict
@@ -54,13 +62,13 @@ from .data import (
     log_rollout_data,
     sync_actor_critic_data,
 )
+
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .weight_update.common import named_params_and_buffers
 from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
 from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
-
 
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
@@ -97,6 +105,8 @@ class MegatronTrainRayActor(TrainRayActor):
         self.genrm_manager = None
 
         init(args)
+        if repatch is not None:
+            repatch(args)
         tq.init(args.tq_config)
         self.data_system_client = tq.get_client()
         if is_megatron_main_rank():
@@ -1202,7 +1212,7 @@ class MegatronTrainRayActor(TrainRayActor):
         flags = torch.tensor(
             [int(rollout_only), int(actor_fwd_only)],
             dtype=torch.int32,
-            device=device_utils.make_current_torch_device(),
+            device="cpu",
         )
         dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=get_gloo_group())
         rollout_only = bool(flags[0].item())
