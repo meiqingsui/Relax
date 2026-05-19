@@ -477,7 +477,7 @@ class EngineGroup:
 
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
-                num_gpus=num_gpus,
+                resources={device_utils.get_ray_accelerator_name(): num_gpus},
                 scheduling_strategy=scheduling_strategy,
                 runtime_env={
                     "env_vars": env_vars,
@@ -1627,6 +1627,7 @@ class RolloutManager(ReloadableMixin):
             for i in range(num_gpus):
                 info_actors.append(
                     InfoActor.options(
+                        resources={device_utils.get_ray_accelerator_name(): 1},
                         scheduling_strategy=PlacementGroupSchedulingStrategy(
                             placement_group=pg,
                             placement_group_bundle_index=i,
@@ -1747,7 +1748,7 @@ class RolloutManager(ReloadableMixin):
                 RolloutRayActor = ray.remote(SGLangEngine)
                 engine = RolloutRayActor.options(
                     num_cpus=0.2,
-                    num_gpus=0.2,
+                    resources={device_utils.get_ray_accelerator_name(): 0.2},
                 ).remote(
                     self.args,
                     rank=total_engines + i,

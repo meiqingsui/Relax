@@ -2,6 +2,10 @@
 
 import logging
 
+try:
+    import mindspeed.megatron_adaptor
+except ImportError:
+    pass
 
 try:
     import relax.models  # noqa
