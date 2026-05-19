@@ -8,6 +8,7 @@ from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from relax.utils import device as device_utils
 
 
 class RayTrainGroup:
@@ -82,7 +83,7 @@ class RayTrainGroup:
 
         actor_impl = MegatronTrainRayActor
 
-        TrainRayActor = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(actor_impl)
+        TrainRayActor = ray.remote(runtime_env={"env_vars": env_vars})(actor_impl)
         lock = Lock.options(num_cpus=1, num_gpus=0).remote()
 
         # Create worker actors
@@ -91,7 +92,7 @@ class RayTrainGroup:
         for rank in range(world_size):
             actor = TrainRayActor.options(
                 num_cpus=num_gpus_per_actor,
-                num_gpus=num_gpus_per_actor,
+                resources={device_utils.get_ray_accelerator_name(): num_gpus_per_actor},
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=reordered_bundle_indices[rank],
