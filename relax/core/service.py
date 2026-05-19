@@ -306,6 +306,7 @@ def create_placement_group(num_gpus):
     for i in range(num_bundles):
         info_actors.append(
             InfoActor.options(
+                resources={accel_resource: 1},
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=i,
