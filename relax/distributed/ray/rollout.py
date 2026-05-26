@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 import numpy as np
 import ray
+from relax.utils.utils import get_ray_accelerator_kwargs
 import transfer_queue as tq
 import yaml
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -472,13 +473,14 @@ class EngineGroup:
             if getattr(self.args, "fp16", False):
                 env_vars["SGLANG_MAMBA_CONV_DTYPE"] = "float16"
 
+            accelerator_kwargs = get_ray_accelerator_kwargs(num_gpus)
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
-                resources={device_utils.get_ray_accelerator_name(): num_gpus},
                 scheduling_strategy=scheduling_strategy,
                 runtime_env={
                     "env_vars": env_vars,
                 },
+                **accelerator_kwargs
             ).remote(
                 self.args,
                 rank=global_rank,
@@ -1621,6 +1623,7 @@ class RolloutManager(ReloadableMixin):
         try:
             # Step 1: Probe GPU topology
             logger.info(f"[ScaleOut] Replica {replica_idx}: probing GPU topology for {num_gpus} GPUs...")
+            accelerator_kwargs = get_ray_accelerator_kwargs(1)
             for i in range(num_gpus):
                 info_actors.append(
                     InfoActor.options(
@@ -1629,6 +1632,7 @@ class RolloutManager(ReloadableMixin):
                             placement_group=pg,
                             placement_group_bundle_index=i,
                         )
+                        **accelerator_kwargs
                     ).remote()
                 )
             gpu_ids = await asyncio.gather(*[actor.get_ip_and_gpu_id.remote() for actor in info_actors])
@@ -1743,9 +1747,10 @@ class RolloutManager(ReloadableMixin):
                 # No GPU needed: this actor is an RPC proxy to the external engine;
                 # NCCL weight sync is orchestrated via HTTP to the remote SGLang process.
                 RolloutRayActor = ray.remote(SGLangEngine)
+                accelerator_kwargs = get_ray_accelerator_kwargs(0.2)
                 engine = RolloutRayActor.options(
                     num_cpus=0.2,
-                    resources={device_utils.get_ray_accelerator_name(): 0.2},
+                    **accelerator_kwargs
                 ).remote(
                     self.args,
                     rank=total_engines + i,
