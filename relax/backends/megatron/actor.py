@@ -1220,7 +1220,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         return rollout_only, actor_fwd_only
 
-    def _wait_for_previous_eval(self, max_wait_seconds: int = 1800) -> None:
+    def _wait_for_previous_eval(self, max_wait_seconds: int = 3600) -> None:
         """Block until the rollout service's previous evaluation has finished.
 
         Only rank 0 polls the rollout HTTP endpoint; all ranks synchronise via
