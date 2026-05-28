@@ -23,9 +23,9 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
+from relax.utils.device import is_npu_available
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
-from relax.utils.device import is_npu_available
 
 
 logger = get_logger(__name__)

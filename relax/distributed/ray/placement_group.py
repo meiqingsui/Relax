@@ -6,9 +6,9 @@ import socket
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
+from relax.utils.device import ray_get_device_ids
 from relax.utils.http_utils import get_host_info
 from relax.utils.logging_utils import get_logger
-from relax.utils.device import ray_get_device_ids
 
 from .actor_group import RayTrainGroup
 
@@ -47,6 +47,7 @@ def _get_head_node_id():
 class InfoActor:
     def get_ip_and_gpu_id(self):
         return ray.util.get_node_ip_address(), ray_get_device_ids()[0]
+
 
 def sort_key(x):
     index, node_identifier, gpu_id = x
