@@ -61,7 +61,7 @@ set -x
 # ── environment setup ───────────────────────────────────────────────────────
 # Use the first GPU node as MASTER_ADDR (prefer head node)
 export MASTER_ADDR=$(ray list nodes --format json | jq -r '
-  map(select(.state == "ALIVE" and (.resources_total.GPU // 0) > 0)) |
+  map(select(.state == "ALIVE" and (.resources_total.NPU // 0) > 0)) |
   sort_by(.is_head_node | not) |
   .[0].node_ip
 ')
