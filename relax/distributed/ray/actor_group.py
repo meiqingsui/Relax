@@ -9,6 +9,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 from relax.utils import device as device_utils
+from relax.utils.utils import get_ray_accelerator_kwargs
 
 
 class RayTrainGroup:
@@ -89,14 +90,15 @@ class RayTrainGroup:
         # Create worker actors
         self._actor_handlers = []
         master_addr, master_port = None, None
+        accelerator_kwargs = get_ray_accelerator_kwargs(num_gpus_per_actor)
         for rank in range(world_size):
             actor = TrainRayActor.options(
                 num_cpus=num_gpus_per_actor,
-                resources={device_utils.get_ray_accelerator_name(): num_gpus_per_actor},
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=reordered_bundle_indices[rank],
                 ),
+                **accelerator_kwargs
             ).remote(world_size, rank, master_addr, master_port, lock)
             if rank == 0:
                 master_addr, master_port = ray.get(actor.get_master_addr_and_port.remote())
