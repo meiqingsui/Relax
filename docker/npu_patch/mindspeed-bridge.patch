@@ -1,0 +1,33 @@
+diff --git a/mindspeed_bridge/models/conversion/utils.py b/mindspeed_bridge/models/conversion/utils.py
+index 99ccba5..7d53cca 100644
+--- a/mindspeed_bridge/models/conversion/utils.py
++++ b/mindspeed_bridge/models/conversion/utils.py
+@@ -57,6 +57,15 @@ def remove_non_pickleables(obj, max_depth: int = 3, current_depth: int = 0):
+ 
+             # Recursively clean attribute
+             cleaned_value = remove_non_pickleables(attr_value, max_depth, current_depth + 1)
++            if hasattr(cleaned_obj, '__setattr__'):
++                try:
++                    setattr(cleaned_obj, attr_name, cleaned_value)
++                except (ValueError, TypeError) as e:
++                    # skip OmegaConf unsupported type
++                    if "Unions of containers" in str(e):
++                        print(f"Skipping attribute '{attr_name}' due to Union type")
++                        continue
++                    raise
+ 
+             # Set the cleaned value (or None if it was removed)
+             setattr(cleaned_obj, attr_name, cleaned_value)
+diff --git a/mindspeed_bridge/models/qwen_vl/qwen35_vl_bridge.py b/mindspeed_bridge/models/qwen_vl/qwen35_vl_bridge.py
+index c826559..617234b 100644
+--- a/mindspeed_bridge/models/qwen_vl/qwen35_vl_bridge.py
++++ b/mindspeed_bridge/models/qwen_vl/qwen35_vl_bridge.py
+@@ -779,7 +779,7 @@ class Qwen35VLBridge(MegatronModelBridge):
+                             v=f"mtp.layers.{mtp_layer}.self_attn.v_proj.weight",
+                         ),
+                         GatedMLPMapping(
+-                            megatron_param=f"language_model.mtp.layers.{mtp_layer}.transformer_layer.linear_fc1.weight*",
++                            megatron_param=f"language_model.mtp.layers.{mtp_layer}.transformer_layer.linear_fc1.weight",
+                             gate=f"mtp.layers.{mtp_layer}.mlp.gate_proj.weight",
+                             up=f"mtp.layers.{mtp_layer}.mlp.up_proj.weight",
+                         ),
