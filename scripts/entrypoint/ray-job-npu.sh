@@ -94,9 +94,9 @@ export MASTER_ADDR=$(ray list nodes --format json | jq -r '
 
 export PYTHONUNBUFFERED=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export MEGATRON=${MEGATRON:-/root/Megatron-LM/}
-export MEGATRON_BRIDGE_SRC=${MEGATRON_BRIDGE_SRC:-/root/Megatron-Bridge/src/}
-export MINDSPEED=${MINDSPEED:-/root/MindSpeed/}
+export MEGATRON=${MEGATRON:-/workspace/Megatron-LM/}
+export MEGATRON_BRIDGE_SRC=${MEGATRON_BRIDGE_SRC:-/workspace/Megatron-Bridge/src/}
+export MINDSPEED=${MINDSPEED:-/workspace/MindSpeed/}
 export RELAX=${RELAX:-${DIR}/../../}
 export PYTHONPATH=${RELAX}:${MEGATRON_BRIDGE_SRC}:${MINDSPEED}:$MEGATRON:$RELAX:${PYTHONPATH:-}
 export MODEL_CONFIG_DIR="${DIR}/../models"

@@ -1,0 +1,794 @@
+diff --git a/mindspeed/arguments.py b/mindspeed/arguments.py
+index c624fd0a..149531f0 100644
+--- a/mindspeed/arguments.py
++++ b/mindspeed/arguments.py
+@@ -81,21 +81,21 @@ def _add_deepseek_args(parser):
+ 
+ def _add_profile_args(parser):
+     group = parser.add_argument_group(title='profile')
+-    group.add_argument("--profile-level", type=str, default='level0',
+-                       choices=['level0', 'level1', 'level2'],
+-                       help="Profile level default level0.")
+-    group.add_argument("--profile-with-cpu", action='store_true', default=False,
+-                       help="Profile with cpu info.")
+-    group.add_argument("--profile-with-stack", action='store_true', default=False,
+-                       help="Profile without stack info.")
+-    group.add_argument("--profile-with-memory", action='store_true', default=False,
+-                       help="Profile without memory info.")
+-    group.add_argument("--profile-record-shapes", action='store_true', default=False,
+-                       help="Profile record shape info.")
+-    group.add_argument("--profile-save-path", type=str, default='./profile_dir',
+-                       help="Profile save path.")
+-    group.add_argument('--profile-ranks', nargs='+', type=int, default=[-1],
+-                       help='Global ranks to profile.The default value of -1 means to profile all ranks')
++    # group.add_argument("--profile-level", type=str, default='level0',
++    #                    choices=['level0', 'level1', 'level2'],
++    #                    help="Profile level default level0.")
++    # group.add_argument("--profile-with-cpu", action='store_true', default=False,
++    #                    help="Profile with cpu info.")
++    # group.add_argument("--profile-with-stack", action='store_true', default=False,
++    #                    help="Profile without stack info.")
++    # group.add_argument("--profile-with-memory", action='store_true', default=False,
++    #                    help="Profile without memory info.")
++    # group.add_argument("--profile-record-shapes", action='store_true', default=False,
++    #                    help="Profile record shape info.")
++    # group.add_argument("--profile-save-path", type=str, default='./profile_dir',
++    #                    help="Profile save path.")
++    # group.add_argument('--profile-ranks', nargs='+', type=int, default=[-1],
++    #                    help='Global ranks to profile.The default value of -1 means to profile all ranks')
+     return parser
+ 
+ 
+diff --git a/mindspeed/core/fusions/fused_rms_norm.py b/mindspeed/core/fusions/fused_rms_norm.py
+index 001efcca..88fea6d1 100644
+--- a/mindspeed/core/fusions/fused_rms_norm.py
++++ b/mindspeed/core/fusions/fused_rms_norm.py
+@@ -31,10 +31,13 @@ class RMSNorm(torch.nn.Module):
+ 
+     def unfused_rmsnorm(self, x):
+         output = self._norm(x.float()).type_as(x)
++        if self.config.layernorm_zero_centered_gamma:
++            return output * (1 + self.weight)
+         return output * self.weight
+ 
+     def fused_rmsnorm(self, x):
+-        return torch_npu.npu_rms_norm(x, self.weight, epsilon=self.eps)[0]
++        weight = 1 + self.weight if self.config.layernorm_zero_centered_gamma else self.weight
++        return torch_npu.npu_rms_norm(x, weight, epsilon=self.eps)[0]
+ 
+     def forward(self, x):
+         if self.config.use_fused_rmsnorm:
+diff --git a/mindspeed/core/fusions/fused_rope.py b/mindspeed/core/fusions/fused_rope.py
+index a6f02e07..267fad59 100644
+--- a/mindspeed/core/fusions/fused_rope.py
++++ b/mindspeed/core/fusions/fused_rope.py
+@@ -126,5 +126,6 @@ def apply_rotary_pos_emb(
+         freqs,
+         rotary_interleaved=config.rotary_interleaved,
+         multi_latent_attention=config.multi_latent_attention,
+-        mscale=mscale
++        mscale=mscale,
++        cp_group=cp_group,
+     )
+diff --git a/mindspeed/core/megatron_basic/arguments_basic.py b/mindspeed/core/megatron_basic/arguments_basic.py
+index 8ea25b9f..97c0a13e 100644
+--- a/mindspeed/core/megatron_basic/arguments_basic.py
++++ b/mindspeed/core/megatron_basic/arguments_basic.py
+@@ -113,3 +113,27 @@ def transformer_config_init_wrapper(fn):
+         fn(self, *args, **known_config)
+ 
+     return wrapper
++
++
++def transformer_config_init_subclass(cls, **kwargs):
++    mutable_types = (list, dict, set, bytearray)
++    unknown_config = {}
++    full_args = vars(get_full_args()).copy()
++    full_args.update(kwargs)
++
++    config_key = inspect.signature(cls).parameters
++    for key, value in full_args.items():
++        if key not in config_key:
++            unknown_config[key] = value
++
++    for key, value in unknown_config.items():
++        if not hasattr(cls, key):
++            cls.__annotations__[key] = type(value)
++            value = field(default_factory=value) if callable(value) and not isinstance(value, type) else value
++            if callable(value) and not isinstance(value, type):
++                value = field(default_factory=value)
++            elif type(value) in mutable_types:
++                value = field(default_factory=lambda: value)
++            else:
++                value = value
++            setattr(cls, key, value)
+\ No newline at end of file
+diff --git a/mindspeed/features_manager/functional/profile.py b/mindspeed/features_manager/functional/profile.py
+index 6450b41c..95b0de25 100644
+--- a/mindspeed/features_manager/functional/profile.py
++++ b/mindspeed/features_manager/functional/profile.py
+@@ -10,20 +10,21 @@ class ProfileFeature(MindSpeedFeature):
+         super().__init__('profile', optimization_level=2)
+ 
+     def register_args(self, parser: ArgumentParser):
+-        group = parser.add_argument_group(title=self.feature_name)
+-        group.add_argument("--profile-level", type=str, default='level0',
+-                           choices=['level0', 'level1', 'level2'],
+-                           help="Profile level default level0.")
+-        group.add_argument("--profile-with-cpu", action='store_true', default=False,
+-                           help="Profile with cpu info.")
+-        group.add_argument("--profile-with-stack", action='store_true', default=False,
+-                           help="Profile with stack info.")
+-        group.add_argument("--profile-with-memory", action='store_true', default=False,
+-                           help="Profile with memory info.")
+-        group.add_argument("--profile-record-shapes", action='store_true', default=False,
+-                           help="Profile record shape info.")
+-        group.add_argument("--profile-save-path", type=str, default='./profile_dir',
+-                           help="Profile save path.")
++        pass
++        # group = parser.add_argument_group(title=self.feature_name)
++        # group.add_argument("--profile-level", type=str, default='level0',
++        #                    choices=['level0', 'level1', 'level2'],
++        #                    help="Profile level default level0.")
++        # group.add_argument("--profile-with-cpu", action='store_true', default=False,
++        #                    help="Profile with cpu info.")
++        # group.add_argument("--profile-with-stack", action='store_true', default=False,
++        #                    help="Profile with stack info.")
++        # group.add_argument("--profile-with-memory", action='store_true', default=False,
++        #                    help="Profile with memory info.")
++        # group.add_argument("--profile-record-shapes", action='store_true', default=False,
++        #                    help="Profile record shape info.")
++        # group.add_argument("--profile-save-path", type=str, default='./profile_dir',
++        #                    help="Profile save path.")
+ 
+     def register_patches(self, patch_manager, args):
+         from mindspeed.functional.profile.adaptor import train_wrapper, train_step_wrapper
+diff --git a/mindspeed/features_manager/megatron_basic/megatron_basic.py b/mindspeed/features_manager/megatron_basic/megatron_basic.py
+index 355913e1..36360d11 100644
+--- a/mindspeed/features_manager/megatron_basic/megatron_basic.py
++++ b/mindspeed/features_manager/megatron_basic/megatron_basic.py
+@@ -43,9 +43,11 @@ class MegatronBasicFeature(MindSpeedFeature):
+ 
+     def register_mcore_basic_patches(self, pm, args):
+         # configuration patches
+-        from mindspeed.core.megatron_basic.arguments_basic import transformer_config_init_wrapper, transformer_config_post_init_wrapper
++        from mindspeed.core.megatron_basic.arguments_basic import (transformer_config_init_wrapper,
++                                                                   transformer_config_post_init_wrapper,
++                                                                   transformer_config_init_subclass)
+         pm.register_patch("megatron.core.transformer.transformer_config.TransformerConfig.__init__", transformer_config_init_wrapper)
+-        pm.register_patch("megatron.core.transformer.transformer_config.MLATransformerConfig.__init__", transformer_config_init_wrapper)
++        pm.register_patch("megatron.core.transformer.transformer_config.TransformerConfig.__init_subclass__", classmethod(transformer_config_init_subclass))
+         pm.register_patch("megatron.core.transformer.transformer_config.TransformerConfig.__post_init__", transformer_config_post_init_wrapper)
+ 
+         # initialization patches
+diff --git a/mindspeed/features_manager/moe/moe_zero_memory.py b/mindspeed/features_manager/moe/moe_zero_memory.py
+index 4d95e64e..f22c53b8 100644
+--- a/mindspeed/features_manager/moe/moe_zero_memory.py
++++ b/mindspeed/features_manager/moe/moe_zero_memory.py
+@@ -24,17 +24,18 @@ class MoEZeroMemoryFeature(MindSpeedFeature):
+ 
+     def pre_validate_args(self, args):
+         #Zero Memory check.
+-        if args.moe_zero_memory_num_layers is not None:
++        if getattr(args, 'moe_zero_memory_num_layers', None) is not None:
+             num_layers_per_pipeline_stage = args.num_layers // args.pipeline_model_parallel_size
+             if args.moe_zero_memory_num_layers < 0 or args.moe_zero_memory_num_layers > num_layers_per_pipeline_stage:
+                 raise AssertionError('`--moe-zero-memory-num-layers` must be between 0 and num layers per pipeline stage')
+             if args.moe_zero_memory == "disable":
+                 raise AssertionError('`--moe-zero-memory` must be enabled when using `--moe-zero-memory-num-layers`')
+-        if args.moe_zero_memory != "disable" and not (args.moe_alltoall_overlap_comm or args.moe_fb_overlap):
++        if getattr(args, 'moe_zero_memory', "disable") != "disable" and not \
++            (getattr(args, 'moe_alltoall_overlap_comm', None) or getattr(args, 'moe_fb_overlap', None)):
+             raise AssertionError('`--moe-zero-memory` only support `--moe-alltoall-overlap-comm` or `--moe-fb-overlap` for now.')
+ 
+     def register_patches(self, patch_manager, args):
+-        if args.moe_zero_memory != 'disable' and args.moe_alltoall_overlap_comm:
++        if getattr(args, 'moe_zero_memory', "disable") and getattr(args, 'moe_alltoall_overlap_comm', None):
+             from mindspeed.core.transformer.moe.moe_feature.overlap.experts import zero_memory_shared_expert_mlp_forward
+             patch_manager.register_patch(
+                 'megatron.core.transformer.moe.shared_experts.SharedExpertMLP.forward',
+diff --git a/mindspeed/megatron_adaptor.py b/mindspeed/megatron_adaptor.py
+index f14b231d..4615590e 100644
+--- a/mindspeed/megatron_adaptor.py
++++ b/mindspeed/megatron_adaptor.py
+@@ -57,6 +57,7 @@ def delete_lock_file():
+ def repatch(args):
+     MindSpeedFeaturesManager.remove_patches()
+     full_args = get_full_args()
++    args = vars(args)
+     for k, v in args.items():
+         setattr(full_args, k, v)
+     MindSpeedFeaturesManager.apply_features_pre_patches(full_args)
+diff --git a/mindspeed/ops/chunk_gated_delta_rule.py b/mindspeed/ops/chunk_gated_delta_rule.py
+new file mode 100644
+index 00000000..04b85e36
+--- /dev/null
++++ b/mindspeed/ops/chunk_gated_delta_rule.py
+@@ -0,0 +1,468 @@
++# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
++# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
++# Copyright (c) 2025, HUAWEI CORPORATION.  All rights reserved.
++
++import warnings
++from typing import Optional
++
++import torch
++import torch.nn.functional as F
++
++from mindspeed.ops.triton.l2norm import l2norm_bwd, l2norm_fwd, l2norm
++from mindspeed.ops.triton.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
++from mindspeed.ops.triton.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
++from mindspeed.ops.triton.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
++from mindspeed.ops.triton.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
++from mindspeed.ops.triton.solve_tril import solve_tril
++from mindspeed.ops.triton.cumsum import chunk_local_cumsum
++from mindspeed.ops.triton.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
++
++
++def chunk_gated_delta_rule_fwd(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    g: torch.Tensor,
++    beta: torch.Tensor,
++    scale: float,
++    initial_state: torch.Tensor,
++    output_final_state: bool,
++    cu_seqlens: Optional[torch.LongTensor] = None,
++    chunk_size: int = 64,
++):
++    g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens, head_first=False)
++    # obtain WY representation. u is actually the new v.
++    A = chunk_scaled_dot_kkt_fwd(
++        k=k,
++        g=g,
++        beta=beta,
++        cu_seqlens=cu_seqlens,
++        chunk_size=chunk_size,
++        output_dtype=torch.float32
++    )
++    A = solve_tril(
++        A=A,
++        cu_seqlens=cu_seqlens,
++        output_dtype=k.dtype
++    )
++    w, u = recompute_w_u_fwd(
++        k=k,
++        v=v,
++        beta=beta,
++        A=A,
++        g=g,
++        cu_seqlens=cu_seqlens,
++    )
++    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
++        k=k,
++        w=w,
++        u=u,
++        g=g,
++        initial_state=initial_state,
++        output_final_state=output_final_state,
++        chunk_size=chunk_size,
++        cu_seqlens=cu_seqlens,
++    )
++    o = chunk_fwd_o(
++        q=q,
++        k=k,
++        v=v_new,
++        h=h,
++        g=g,
++        scale=scale,
++        cu_seqlens=cu_seqlens,
++        chunk_size=chunk_size,
++    )
++    return g, o, A, final_state
++
++
++def chunk_gated_delta_rule_bwd(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    g: torch.Tensor,
++    beta: torch.Tensor,
++    A: torch.Tensor,
++    scale: float,
++    initial_state: torch.Tensor,
++    do: torch.Tensor,
++    dht: torch.Tensor,
++    cu_seqlens: Optional[torch.LongTensor] = None,
++    chunk_size: int = 64,
++):
++    w, u = recompute_w_u_fwd(
++        k=k,
++        v=v,
++        beta=beta,
++        A=A,
++        g=g,
++        cu_seqlens=cu_seqlens,
++    )
++    h, v_new, _ = chunk_gated_delta_rule_fwd_h(
++        k=k,
++        w=w,
++        u=u,
++        g=g,
++        initial_state=initial_state,
++        output_final_state=False,
++        cu_seqlens=cu_seqlens,
++        chunk_size=chunk_size,
++    )
++    dv = chunk_bwd_dv_local(
++        q=q,
++        k=k,
++        g=g,
++        do=do,
++        scale=scale,
++        cu_seqlens=cu_seqlens,
++        chunk_size=chunk_size,
++    )
++    dh, dh0, dv = chunk_gated_delta_rule_bwd_dhu(
++        q=q,
++        k=k,
++        w=w,
++        g=g,
++        h0=initial_state,
++        dht=dht,
++        do=do,
++        dv=dv,
++        scale=scale,
++        cu_seqlens=cu_seqlens,
++        chunk_size=chunk_size,
++    )
++    dq, dk, dw, dg = chunk_bwd_dqkwg(
++        q=q,
++        k=k,
++        v=v_new,
++        w=w,
++        g=g,
++        h=h,
++        dv=dv,
++        do=do,
++        dh=dh,
++        chunk_size=chunk_size,
++        scale=scale,
++        cu_seqlens=cu_seqlens,
++    )
++    dk2, dv, db, dg2 = prepare_wy_repr_bwd(
++        k=k,
++        v=v,
++        beta=beta,
++        g=g,
++        A=A,
++        dw=dw,
++        du=dv,
++        cu_seqlens=cu_seqlens,
++        chunk_size=chunk_size
++    )
++    dk.add_(dk2)
++    dg.add_(dg2)
++    if dg.dtype != torch.float32:
++        raise ValueError(
++            f"dg current type is {dg.dtype} , should be float32"
++        )
++    dg = chunk_local_cumsum(dg, chunk_size=chunk_size, reverse=True, cu_seqlens=cu_seqlens, head_first=False)
++    return dq, dk, dv, db, dg, dh0
++
++
++class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
++
++    @staticmethod
++    @input_guard
++    @autocast_custom_fwd
++    def forward(
++        ctx,
++        q: torch.Tensor,
++        k: torch.Tensor,
++        v: torch.Tensor,
++        g: torch.Tensor,
++        beta: torch.Tensor,
++        scale: float,
++        initial_state: torch.Tensor,
++        output_final_state: bool,
++        cu_seqlens: Optional[torch.LongTensor] = None,
++        use_qk_l2norm_in_kernel: bool = False,
++        chunk_size: int = 64,
++    ):
++        if use_qk_l2norm_in_kernel:
++            q, q_rstd = l2norm_fwd(q)
++            k, k_rstd = l2norm_fwd(k)
++        else:
++            q_rstd, k_rstd = None, None
++
++        g, o, A, final_state = chunk_gated_delta_rule_fwd(
++            q=q,
++            k=k,
++            v=v,
++            g=g,
++            beta=beta,
++            scale=scale,
++            initial_state=initial_state,
++            output_final_state=output_final_state,
++            cu_seqlens=cu_seqlens,
++            chunk_size=chunk_size
++        )
++        ctx.save_for_backward(q, q_rstd, k, k_rstd, v, g, beta, A, initial_state, cu_seqlens)
++        ctx.scale = scale
++        ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
++        ctx.chunk_size = chunk_size
++        return o.to(q.dtype), final_state
++
++    @staticmethod
++    @input_guard
++    @autocast_custom_bwd
++    def backward(
++        ctx,
++        do: torch.Tensor,
++        dht: torch.Tensor
++    ):
++        q, q_rstd, k, k_rstd, v, g, beta, A, initial_state, cu_seqlens= ctx.saved_tensors
++        dq, dk, dv, db, dg, dh0 = chunk_gated_delta_rule_bwd(
++            q=q,
++            k=k,
++            v=v,
++            g=g,
++            beta=beta,
++            A=A,
++            scale=ctx.scale,
++            initial_state=initial_state,
++            do=do,
++            dht=dht,
++            cu_seqlens=cu_seqlens,
++            chunk_size=ctx.chunk_size,
++        )
++        if ctx.use_qk_l2norm_in_kernel:
++            dq = l2norm_bwd(q, q_rstd, dq)
++            dk = l2norm_bwd(k, k_rstd, dk)
++        return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, dh0, None, None, None, None
++
++
++@torch.compiler.disable
++def chunk_gated_delta_rule(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    g: torch.Tensor,
++    beta: torch.Tensor,
++    scale: float = None,
++    initial_state: torch.Tensor = None,
++    output_final_state: bool = False,
++    use_qk_l2norm_in_kernel: bool = False,
++    cu_seqlens: Optional[torch.LongTensor] = None,
++    chunk_size: int = 64,
++    head_first: bool = False,
++):
++    # print(f"{__file__=} =============", flush=True)
++    r"""
++    Args:
++        q (torch.Tensor):
++            queries of shape `[B, T, H, K]`.
++        k (torch.Tensor):
++            keys of shape `[B, T, H, K]`.
++        v (torch.Tensor):
++            values of shape `[B, T, H, V]`.
++        g (torch.Tensor):
++            (forget) gating tensor (in log space!) of shape `[B, T, H]`.
++        beta (torch.Tensor):
++            betas of shape `[B, T, H]`.
++        scale (Optional[float]):
++            Scale factor for the RetNet attention scores.
++            If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
++        initial_state (Optional[torch.Tensor]):
++            Initial state of shape `[N, H, K, V]` for `N` input sequences.
++            For equal-length input sequences, `N` equals the batch size `B`.
++            Default: `None`.
++        output_final_state (Optional[bool]):
++            Whether to output the final state of shape `[N, H, K, V]`. Default: `False`.
++        use_qk_l2norm_in_kernel (bool):
++            Whether to apply L2norm to the q/k tensor internally. Default: `False`.
++        cu_seqlens (torch.LongTensor):
++            Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
++            consistent with the FlashAttention API.
++        head_first (Optional[bool]):
++            Whether the inputs are in the head-first format. Default: `False`.
++            This argument has been deprecated.
++
++    Returns:
++        o (torch.Tensor):
++            Outputs of shape `[B, T, H, V]`.
++        final_state (torch.Tensor):
++            Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
++
++    Examples::
++        >>> import torch
++        >>> import torch.nn.functional as F
++        >>> from einops import rearrange
++        >>> from fla.ops.gated_delta_rule import chunk_gated_delta_rule
++        # inputs with equal lengths
++        >>> B, T, H, K, V = 4, 2048, 4, 512, 512
++        >>> q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device='cuda')
++        >>> k = F.normalize(torch.randn(B, T, H, K, dtype=torch.bfloat16, device='cuda'), p=2, dim=-1)
++        >>> v = torch.randn(B, T, H, V, dtype=torch.bfloat16, device='cuda')
++        >>> beta = torch.rand(B, T, H, dtype=torch.bfloat16, device='cuda').sigmoid()
++        >>> g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.bfloat16, device='cuda'))
++        >>> h0 = torch.randn(B, H, K, V, dtype=torch.bfloat16, device='cuda')
++        >>> o, ht = chunk_gated_delta_rule(
++            q, k, v, g, beta,
++            initial_state=h0,
++            output_final_state=True
++        )
++        # for variable-length inputs, the batch size `B` is expected to be 1 and `cu_seqlens` is required
++        >>> q, k, v, beta, g = map(lambda x: rearrange(x, 'b t ... -> 1 (b t) ...'), (q, k, v, beta, g))
++        # for a batch with 4 sequences, `cu_seqlens` with 5 start/end positions are expected
++        >>> cu_seqlens = q.new_tensor([0, 2048, 4096, 6144, 8192], dtype=torch.long)
++        >>> o, ht = chunk_gated_delta_rule(
++            q, k, v, g, beta,
++            initial_state=h0,
++            output_final_state=True,
++            cu_seqlens=cu_seqlens
++        )
++    """
++    if q.dtype != k.dtype or k.dtype != v.dtype:
++        raise ValueError(
++            f"q current type is {q.dtype} , k current type is {k.dtype} ,v current type is {v.dtype} , they should are equal"
++        )
++    if q.dtype == torch.float32:
++        raise ValueError(
++            "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
++        )
++    if len(beta.shape) != 3:
++        raise ValueError(
++            f"beta current shape len is {len(beta.shape)}, beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
++        )
++
++    if head_first:
++        warnings.warn(
++            "head_first is deprecated and will be removed in a future version. "
++            "Please use head_first=False for now instead."
++        )
++    if not head_first and q.shape[1] < q.shape[2]:
++        warnings.warn(
++            f"Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "
++            "This may indicate the inputs were passed in head-first format [B, H, T, ...] "
++            "when head_first=False was specified. "
++            "Please verify your input tensor format matches the expected shape [B, T, H, ...]."
++        )
++    if cu_seqlens is not None:
++        if q.shape[0] != 1:
++            raise ValueError(
++                f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
++                f"Please flatten variable-length inputs before processing."
++            )
++        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
++            raise ValueError(
++                f"The number of initial states is expected to be equal to the number of input sequences, "
++                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
++            )
++    if scale is None:
++        scale = k.shape[-1] ** -0.5
++    o, final_state = ChunkGatedDeltaRuleFunction.apply(
++        q,
++        k,
++        v,
++        g,
++        beta,
++        scale,
++        initial_state,
++        output_final_state,
++        cu_seqlens,
++        use_qk_l2norm_in_kernel,
++        chunk_size
++    )
++    return o, final_state
++
++
++####################
++# Torch native gated delta rule
++####################
++def torch_chunk_gated_delta_rule(
++    query,
++    key,
++    value,
++    g,
++    beta,
++    chunk_size=64,
++    initial_state=None,
++    output_final_state=False,
++    use_qk_l2norm_in_kernel=False,
++):
++    # pylint: disable=line-too-long
++    '''
++    Torch-native implementation of chunked gated delta rule for deterministic mode.
++    Need this because FLA is not deterministic.
++    '''
++
++    initial_dtype = query.dtype
++    if use_qk_l2norm_in_kernel:
++        query = l2norm(query, dim=-1, eps=1e-6)
++        key = l2norm(key, dim=-1, eps=1e-6)
++    query, key, value, beta, g = [
++        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
++    ]
++
++    batch_size, num_heads, sequence_length, k_head_dim = key.shape
++    v_head_dim = value.shape[-1]
++    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
++    query = F.pad(query, (0, 0, 0, pad_size))
++    key = F.pad(key, (0, 0, 0, pad_size))
++    value = F.pad(value, (0, 0, 0, pad_size))
++    beta = F.pad(beta, (0, pad_size))
++    g = F.pad(g, (0, pad_size))
++    total_sequence_length = sequence_length + pad_size
++    scale = 1 / (query.shape[-1] ** 0.5)
++    query = query * scale
++
++    v_beta = value * beta.unsqueeze(-1)
++    k_beta = key * beta.unsqueeze(-1)
++    # reshape to chunks
++    query, key, value, k_beta, v_beta = [
++        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
++        for x in (query, key, value, k_beta, v_beta)
++    ]
++    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
++    mask = torch.triu(
++        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
++    )
++
++    # chunk decay
++    g = g.cumsum(dim=-1)
++    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
++    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
++    for i in range(1, chunk_size):
++        row = attn[..., i, :i].clone()
++        sub = attn[..., :i, :i].clone()
++        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
++    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
++    value = attn @ v_beta
++    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
++    last_recurrent_state = (
++        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
++        if initial_state is None
++        else initial_state.to(value)
++    )
++    core_attn_out = torch.zeros_like(value)
++    mask = torch.triu(
++        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
++    )
++
++    # for each chunk
++    for i in range(0, total_sequence_length // chunk_size):
++        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
++        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
++        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
++        v_new = v_i - v_prime
++        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
++        core_attn_out[:, :, i] = attn_inter + attn @ v_new
++        last_recurrent_state = (
++            last_recurrent_state * g[:, :, i, -1, None, None].exp()
++            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
++        )
++
++    if not output_final_state:
++        last_recurrent_state = None
++    core_attn_out = core_attn_out.reshape(
++        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
++    )
++    core_attn_out = core_attn_out[:, :, :sequence_length]
++    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
++    return core_attn_out, last_recurrent_state
+\ No newline at end of file
+diff --git a/mindspeed/patch_utils.py b/mindspeed/patch_utils.py
+index a489d58c..c3cd6f9f 100644
+--- a/mindspeed/patch_utils.py
++++ b/mindspeed/patch_utils.py
+@@ -1,4 +1,5 @@
+ import importlib
++import inspect
+ import sys
+ import types
+ from typing import List, Dict, Union
+@@ -93,8 +94,12 @@ class Patch:
+ 
+     def remove_patch(self):
+         for key, value in sys.modules.copy().items():
+-            if 'mindspeed' in key:
++            if 'mindspeed' in key or 'torch.classes' == key:
+                 continue
++
++            if inspect.isclass(self.orig_module) and hasattr(value, self.orig_module_name.split('.')[-1]):
++                value = getattr(value, self.orig_module_name.split('.')[-1])
++
+             if self.orig_func_name is not None and hasattr(value, self.orig_func_name) \
+                     and id(getattr(value, self.orig_func_name)) == id(self.final_patch_func):
+                 setattr(value, self.orig_func_name, self.orig_func)
+diff --git a/mindspeed/te/pytorch/attention/dot_product_attention/dot_product_attention.py b/mindspeed/te/pytorch/attention/dot_product_attention/dot_product_attention.py
+index ac4eabe5..44f21ba2 100644
+--- a/mindspeed/te/pytorch/attention/dot_product_attention/dot_product_attention.py
++++ b/mindspeed/te/pytorch/attention/dot_product_attention/dot_product_attention.py
+@@ -1,11 +1,12 @@
+ # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
++# Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+ 
+ import dataclasses
+ import math
+ import os
+ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+ 
++import torch.distributed as dist
+ import torch
+ import torch_npu
+ from megatron.core.packed_seq_params import PackedSeqParams
+@@ -13,7 +14,7 @@ from megatron.core.parallel_state import (
+     get_context_parallel_group,
+     get_context_parallel_global_ranks,
+     get_tensor_model_parallel_group,
+-    get_hierarchical_context_parallel_groups
++    get_hierarchical_context_parallel_groups    
+ )
+ from megatron.core.process_groups_config import ProcessGroupCollection
+ 
+@@ -320,6 +321,8 @@ class DotProductAttention(torch.nn.Module):
+         cu_seqlens_kv_padded: torch.Tensor = None,
+         max_seqlen_q: int = None,
+         max_seqlen_kv: int = None,
++        local_cp_size: int = None,
++        cp_group: dist.ProcessGroup = None,
+         attn_mask_type: Optional[str] = None,
+         window_size: Optional[Tuple[int, int]] = None,
+         checkpoint_core_attention: bool = False,
+@@ -587,14 +590,14 @@ class MindSpeedTEDotProductAttention(DotProductAttention):
+         else:
+             assert hasattr(
+                 pg_collection, "tp"
+-            ), "TEDotProductAttention model_comm_pgs must have tp pg"
++            ), "TEDotProductAttention pg_collection must have tp pg"
+             assert hasattr(
+                 pg_collection, "cp"
+-            ), "TEDotProductAttention model_comm_pgs must have cp pg"
+-            if pg_collection == "a2a+p2p":
++            ), "TEDotProductAttention pg_collection must have cp pg"
++            if cp_comm_type == "a2a+p2p":
+                 assert hasattr(
+                     pg_collection, "hcp"
+-                ), "TEDotProductAttention model_comm_pgs must have hierarchical cp pg"
++                ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
+ 
+         # This check is important as CP config can be disabled while having a valid CP group
+         if self.config.context_parallel_size > 1:
+@@ -659,6 +662,9 @@ class MindSpeedTEDotProductAttention(DotProductAttention):
+         ) and not getattr(self.config, 'is_llava', False):
+             self.config.sparse_mode = 2
+             attention_mask = get_attention_mask(self.config)
++        attention_mask = torch.triu(
++            torch.ones((2048, 2048),
++                       device=query.device, dtype=torch.bool), diagonal=1)
+ 
+         packed_seq_kwargs = (
+             {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}
+diff --git a/mindspeed/te/pytorch/module/layernorm_column_parallel_linear.py b/mindspeed/te/pytorch/module/layernorm_column_parallel_linear.py
+index d04f8a62..416a9da5 100644
+--- a/mindspeed/te/pytorch/module/layernorm_column_parallel_linear.py
++++ b/mindspeed/te/pytorch/module/layernorm_column_parallel_linear.py
+@@ -224,12 +224,20 @@ class MindSpeedTELayerNormColumnParallelLinear(torch.nn.Module):
+                             bias=self.layer_norm_bias,
+                             eps=self.config.layernorm_epsilon
+                             )
+-
++    
++    def _rmsnorm_scale(self, x_norm):
++        """Plain γ*x_norm or TE zero-centered (1+γ)*x_norm."""
++        if getattr(self.config, "layernorm_zero_centered_gamma", False):
++            return x_norm * (1 + self.layer_norm_weight)
++        return x_norm * self.layer_norm_weight
++    
+     def _rmsnorm(self, inp):
+-        if self.config.use_fused_rmsnorm:
++        zero_centered_gamma = getattr(self.config, "layernorm_zero_centered_gamma", False)
++        use_fused = self.config.use_fused_rmsnorm and not zero_centered_gamma
++        if use_fused:
+             return torch_npu.npu_rms_norm(inp, self.layer_norm_weight, epsilon=self.config.layernorm_epsilon)[0]
+-        return (inp * torch.rsqrt(inp.pow(2).mean(-1, keepdim=True) + self.config.layernorm_epsilon)) \
+-                * self.layer_norm_weight
++        x_norm = inp * torch.rsqrt(inp.pow(2).mean(-1, keepdim=True) + self.config.layernorm_epsilon)
++        return self._rmsnorm_scale(x_norm)
+ 
+     def enable_recompute_norm(self, norm_ckpt):
+         self.is_recompute_norm = True
