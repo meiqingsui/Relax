@@ -1,0 +1,935 @@
+From 8757f1fd40e408ff0823107f198f262e6bf01221 Mon Sep 17 00:00:00 2001
+From: huangxudong <hxd_a@qq.com>
+Date: Mon, 15 Jun 2026 19:20:09 +0800
+Subject: [PATCH] tms adapt colacate
+
+---
+ contrib/torch_memory_saver/csrc/core.cpp      |  56 ++++++-
+ .../torch_memory_saver/csrc/entrypoint.cpp    |  50 ++++--
+ contrib/torch_memory_saver/csrc/utils.h       |  22 +++
+ .../python/torch_memory_saver/entrypoint.py   |  42 +++--
+ .../torch_memory_saver/hooks/mode_preload.py  |  14 +-
+ contrib/torch_memory_saver/test/cuda_graph.py | 152 ++++++++++++++++++
+ .../torch_memory_saver/test/multi_device.py   |   3 -
+ contrib/torch_memory_saver/test/rl_example.py |  39 +++--
+ contrib/torch_memory_saver/test/simple.py     |   3 -
+ .../test/test_disable_releases_pool.py        | 121 ++++++++++++++
+ .../test/training_engine.py                   |  96 +++++++++++
+ 11 files changed, 533 insertions(+), 65 deletions(-)
+ create mode 100644 contrib/torch_memory_saver/test/cuda_graph.py
+ create mode 100644 contrib/torch_memory_saver/test/test_disable_releases_pool.py
+ create mode 100644 contrib/torch_memory_saver/test/training_engine.py
+
+diff --git a/contrib/torch_memory_saver/csrc/core.cpp b/contrib/torch_memory_saver/csrc/core.cpp
+index 581971c..e04bca1 100644
+--- a/contrib/torch_memory_saver/csrc/core.cpp
++++ b/contrib/torch_memory_saver/csrc/core.cpp
+@@ -1,4 +1,5 @@
+ #include "core.h"
++#include "api_forwarder.h"
+ #include "utils.h"
+ 
+ TorchMemorySaver::TorchMemorySaver() {}
+@@ -23,6 +24,15 @@ aclError TorchMemorySaver::malloc(void **ptr, int device, size_t size,
+         *ptr, AllocationMetadata{size, device, allocHandle, tag,
+                                  enable_cpu_backup, nullptr});
+   }
++  if (enable_cpu_backup) {
++    std::cerr << "[TMS-MALLOC] enable_cpu_backup=true"
++              << " ptr=" << *ptr
++              << " size=" << size
++              << " tag=" << tag
++              << " device=" << device
++              << " map_size=" << allocation_metadata_.size()
++              << std::endl;
++  }
+ #ifdef TMS_DEBUG_LOG
+   std::cout << "[torch_memory_saver.cpp] TorchMemorySaver.cuda_malloc "
+             << " ptr=" << ptr << " *ptr=" << *ptr << " size=" << size
+@@ -35,14 +45,43 @@ aclError TorchMemorySaver::free(void *ptr) {
+   AllocationMetadata metadata;
+   {
+     const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+-    SIMPLE_CHECK(allocation_metadata_.count(ptr),
+-                 "Trying to free a pointer not allocated here");
++    if (allocation_metadata_.count(ptr) == 0) {
++      return APIForwarder::call_real_aclrt_free(ptr);
++    }
+     metadata = allocation_metadata_[ptr];
+     allocation_metadata_.erase(ptr);
+   }
+-  int ret = aclrtUnmapMem(ptr);
++
++  if (metadata.enable_cpu_backup) {
++    std::cerr << "[TMS-FREE] enable_cpu_backup=true"
++              << " ptr=" << ptr
++              << " size=" << metadata.size
++              << " tag=" << metadata.tag
++              << " had_cpu_backup=" << (metadata.cpu_backup != nullptr)
++              << " map_size=" << allocation_metadata_.size()
++              << std::endl;
++  }
++
++  static constexpr int32_t kSyncTimeoutMs = 3000;
++  int ret = aclrtSynchronizeDeviceWithTimeout(kSyncTimeoutMs);
++  SIMPLE_CHECK(ret == ACL_SUCCESS, "aclrtSynchronizeDeviceWithTimeout failed.");
++  ret = aclrtUnmapMem(ptr);
++  if (ret != ACL_SUCCESS) { 
++    std::cout << "[TMS-FREE] aclUnmapMem failed"
++              << " ret=" << ret << " ptr=" << ptr <<std::endl;
++  }
++  SIMPLE_CHECK(ret == ACL_SUCCESS, "aclrtUnmapMem failed.");
+   ret = aclrtFreePhysical(metadata.allocHandle);
++  SIMPLE_CHECK(ret == ACL_SUCCESS, "aclrtFreePhysical failed.");
+   ret = aclrtReleaseMemAddress(ptr);
++  SIMPLE_CHECK(ret == ACL_SUCCESS, "aclrtReleaseMemAddress failed.");
++
++  if (nullptr != metadata.cpu_backup) {
++    ret = aclrtFreeHost(metadata.cpu_backup);
++    SIMPLE_CHECK(ret == ACL_SUCCESS, "aclrtFreeHost failed.");
++    metadata.cpu_backup = nullptr;
++  }
++
+ #ifdef TMS_DEBUG_LOG
+   std::cout << "[torch_memory_saver.cpp] TorchMemorySaver.cuda_free "
+             << " ptr=" << ptr << " metadata.size=" << metadata.size
+@@ -73,7 +112,9 @@ void TorchMemorySaver::pause(const std::string &tag) {
+     }
+ 
+     int ret = aclrtUnmapMem(ptr);
++    SIMPLE_CHECK(ret == ACL_SUCCESS, "aclrtUnmapMem failed.");
+     ret = aclrtFreePhysical(metadata.allocHandle);
++    SIMPLE_CHECK(ret == ACL_SUCCESS, "aclrtFreePhysical failed.");
+ 
+ #ifdef TMS_DEBUG_LOG
+     std::cout << "[torch_memory_saver.cpp] TorchMemorySaver.pause"
+@@ -105,6 +146,15 @@ void TorchMemorySaver::resume(const std::string &tag) {
+     aclrtMapMem(ptr, metadata.size, 0, newAllocHandle, 0);
+ 
+     if (metadata.enable_cpu_backup) {
++      if (metadata.cpu_backup == nullptr) {
++        std::cerr << "[TMS-RESUME-FATAL] null cpu_backup"
++                  << " ptr=" << ptr
++                  << " size=" << metadata.size
++                  << " tag=" << metadata.tag
++                  << " device=" << metadata.device
++                  << " map_size=" << allocation_metadata_.size()
++                  << std::endl;
++      }
+       SIMPLE_CHECK(metadata.cpu_backup != nullptr,
+                    "cpu_backup should not be nullptr");
+       // TODO may use cudaMemcpyAsync if needed
+diff --git a/contrib/torch_memory_saver/csrc/entrypoint.cpp b/contrib/torch_memory_saver/csrc/entrypoint.cpp
+index 3f266dc..17ea097 100644
+--- a/contrib/torch_memory_saver/csrc/entrypoint.cpp
++++ b/contrib/torch_memory_saver/csrc/entrypoint.cpp
+@@ -1,14 +1,36 @@
+ #include "api_forwarder.h"
+ #include "core.h"
+ #include "utils.h"
++#include <optional>
+ 
+ // ----------------------------------------------- threadlocal configs
+ // --------------------------------------------------
+ 
+ struct ThreadLocalConfig {
+-  bool is_interesting_region_ = false;
++public:
+   std::string current_tag_ = "default";
+-  bool enable_cpu_backup_ = false;
++
++  bool is_interesting_region() {
++    if (!is_interesting_region_.has_value()) {
++      is_interesting_region_ = get_bool_env_var("TMS_INIT_ENABLE");
++    }
++    return is_interesting_region_.value();
++  }
++
++  void set_interesting_region(bool value) { is_interesting_region_ = value; }
++
++  bool enable_cpu_backup() {
++    if (!enable_cpu_backup_.has_value()) {
++      enable_cpu_backup_ = get_bool_env_var("TMS_INIT_ENABLE_CPU_BACKUP");
++    }
++    return enable_cpu_backup_.value();
++  }
++
++  void set_enable_cpu_backup(bool value) { enable_cpu_backup_ = value; }
++
++private:
++  std::optional<bool> is_interesting_region_;
++  std::optional<bool> enable_cpu_backup_;
+ };
+ static thread_local ThreadLocalConfig thread_local_config;
+ 
+@@ -18,23 +40,17 @@ static thread_local ThreadLocalConfig thread_local_config;
+ #ifdef TMS_HOOK_MODE_PRELOAD
+ aclError aclrtMallocAlign32(void **ptr, size_t size,
+                             aclrtMemMallocPolicy policy) {
+-  if (thread_local_config.is_interesting_region_) {
++  if (thread_local_config.is_interesting_region()) {
+     return TorchMemorySaver::instance().malloc(
+         ptr, CANNUtils::cann_ctx_get_device(), size,
+         thread_local_config.current_tag_,
+-        thread_local_config.enable_cpu_backup_);
++        thread_local_config.enable_cpu_backup());
+   } else {
+     return APIForwarder::call_real_aclrt_malloc_align32(ptr, size, policy);
+   }
+ }
+ 
+-aclError aclrtFree(void *ptr) {
+-  if (thread_local_config.is_interesting_region_) {
+-    return TorchMemorySaver::instance().free(ptr);
+-  } else {
+-    return APIForwarder::call_real_aclrt_free(ptr);
+-  }
+-}
++aclError aclrtFree(void *ptr) { return TorchMemorySaver::instance().free(ptr); }
+ #endif
+ 
+ #ifdef TMS_HOOK_MODE_TORCH
+@@ -45,12 +61,12 @@ void *tms_torch_malloc(ssize_t size, int device, aclrtStream stream) {
+             << " size=" << size << " device=" << device << " stream=" << stream
+             << std::endl;
+ #endif
+-  SIMPLE_CHECK(thread_local_config.is_interesting_region_,
++  SIMPLE_CHECK(thread_local_config.is_interesting_region(),
+                "only support interesting region");
+   void *ptr;
+   TorchMemorySaver::instance().malloc(&ptr, CANNUtils::cann_device_get(device),
+                                       size, thread_local_config.current_tag_,
+-                                      thread_local_config.enable_cpu_backup_);
++                                      thread_local_config.enable_cpu_backup());
+   return ptr;
+ }
+ 
+@@ -60,7 +76,7 @@ void tms_torch_free(void *ptr, ssize_t ssize, int device, aclrtStream stream) {
+             << " ptr=" << ptr << " ssize=" << ssize << " device=" << device
+             << " stream=" << stream << std::endl;
+ #endif
+-  SIMPLE_CHECK(thread_local_config.is_interesting_region_,
++  SIMPLE_CHECK(thread_local_config.is_interesting_region(),
+                "only support interesting region");
+   TorchMemorySaver::instance().free(ptr);
+ }
+@@ -72,11 +88,11 @@ void tms_torch_free(void *ptr, ssize_t ssize, int device, aclrtStream stream) {
+ 
+ extern "C" {
+ void tms_set_interesting_region(bool is_interesting_region) {
+-  thread_local_config.is_interesting_region_ = is_interesting_region;
++  thread_local_config.set_interesting_region(is_interesting_region);
+ }
+ 
+ bool tms_get_interesting_region() {
+-  return thread_local_config.is_interesting_region_;
++  return thread_local_config.is_interesting_region();
+ }
+ 
+ void tms_set_current_tag(const char *tag) {
+@@ -85,7 +101,7 @@ void tms_set_current_tag(const char *tag) {
+ }
+ 
+ void tms_set_enable_cpu_backup(bool enable_cpu_backup) {
+-  thread_local_config.enable_cpu_backup_ = enable_cpu_backup;
++  thread_local_config.set_enable_cpu_backup(enable_cpu_backup);
+ }
+ 
+ void tms_pause(const char *tag) {
+diff --git a/contrib/torch_memory_saver/csrc/utils.h b/contrib/torch_memory_saver/csrc/utils.h
+index fd837e4..980273f 100644
+--- a/contrib/torch_memory_saver/csrc/utils.h
++++ b/contrib/torch_memory_saver/csrc/utils.h
+@@ -47,3 +47,25 @@ static int cann_ctx_get_device() {
+ static int cann_device_get(int device_ordinal) { return device_ordinal; }
+ 
+ } // namespace CANNUtils
++
++inline bool get_bool_env_var(const char *name) {
++  const char *env_cstr = std::getenv(name);
++  if (env_cstr == nullptr) {
++    return false;
++  }
++
++  std::string env_str(env_cstr);
++  if (env_str == "1" || env_str == "true" || env_str == "TRUE" ||
++      env_str == "yes" || env_str == "YES") {
++    return true;
++  }
++  if (env_str == "0" || env_str == "false" || env_str == "FALSE" ||
++      env_str == "no" || env_str == "NO") {
++    return false;
++  }
++
++  std::cerr
++      << "[torch_memory_saver.cpp] Unsupported environment variable value "
++      << " name=" << name << " value=" << env_str << std::endl;
++  return false;
++}
+diff --git a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py b/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
+index 5281340..cc69733 100644
+--- a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
++++ b/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
+@@ -5,6 +5,7 @@ from contextlib import contextmanager
+ from typing import Optional
+ 
+ import torch
++import torch_npu
+ 
+ from .binary_wrapper import BinaryWrapper
+ from .hooks.base import HookMode, HookUtilBase
+@@ -50,15 +51,18 @@ class TorchMemorySaver:
+ 
+     @contextmanager
+     def disable(self):
++        self._ensure_initialized()
+         with self._impl.disable():
+             yield
+ 
+     def pause(self, tag: Optional[str] = None):
+         """Pause memory for specific tag or all memory if tag is None"""
++        self._ensure_initialized()
+         self._impl.pause(tag=tag)
+ 
+     def resume(self, tag: Optional[str] = None):
+         """Resume memory for specific tag or all memory if tag is None"""
++        self._ensure_initialized()
+         self._impl.resume(tag=tag)
+ 
+     # for compatibility
+@@ -85,7 +89,9 @@ class TorchMemorySaver:
+ 
+ 
+ class _TorchMemorySaverImpl:
+-    def __init__(self, hook_mode: HookMode = "torch"):
++    def __init__(self, hook_mode: HookMode = None):
++        if hook_mode is None:
++            hook_mode = os.environ.get("TMS_HOOK_MODE", "torch")
+         self._hook_mode = hook_mode
+         self._hook_util = HookUtilBase.create(hook_mode=hook_mode)
+         self._binary_wrapper = BinaryWrapper(
+@@ -134,17 +140,35 @@ class _TorchMemorySaverImpl:
+             )
+ 
+     @contextmanager
+-    def disable(self):
+-        old_is_interesting_region = (
+-            self._binary_wrapper.cdll.tms_get_interesting_region()
+-        )
++    def disable(self, dispose_mem_pool_after_use: bool = True):
++        if not dispose_mem_pool_after_use:
++            raise ValueError("Only dispose_mem_pool_after_use=True is supported now")
++        if not self._binary_wrapper.cdll.tms_get_interesting_region():
++            raise RuntimeError("disable() should be called only when tms is active")
++
+         self._binary_wrapper.cdll.tms_set_interesting_region(False)
+         try:
+-            yield
++            # Affected by the memory allocation mechanism of torch_npu, a new mempool must be adopted.
++            # Otherwise, paused virtual addresses may be reused, causing memory conflicts and trigger errors.
++            pool = torch.npu.MemPool()
++            with torch.npu.use_mem_pool(pool):
++                yield
++
++            torch.npu.synchronize()
++            # _npu_releasePool only marks the pool's blocks as reclaimable in the
++            # caching allocator; the device memory is not handed back to the driver
++            # until empty_cache() runs. We empty_cache() here (while tms is active,
++            # i.e. before re-entering the interesting region) so that the pool's
++            # buffers are released immediately instead of leaking into the next
++            # sleep/rollout cycle. Calling empty_cache() in the active state is
++            # safe because tms-paused virtual addresses are not visible to torch's
++            # caching allocator (their backing physical memory was already freed
++            # via aclrtFreePhysical in pause()).
++            torch_npu._C._npu_releasePool(torch.npu.current_device(), pool.id)
++            del pool
++            torch.npu.empty_cache()
+         finally:
+-            self._binary_wrapper.cdll.tms_set_interesting_region(
+-                old_is_interesting_region
+-            )
++            self._binary_wrapper.cdll.tms_set_interesting_region(True)
+ 
+     def pause(self, tag: Optional[str]):
+         tag_bytes = tag.encode("utf-8") if tag else None
+diff --git a/contrib/torch_memory_saver/python/torch_memory_saver/hooks/mode_preload.py b/contrib/torch_memory_saver/python/torch_memory_saver/hooks/mode_preload.py
+index 2526da3..e4f3135 100644
+--- a/contrib/torch_memory_saver/python/torch_memory_saver/hooks/mode_preload.py
++++ b/contrib/torch_memory_saver/python/torch_memory_saver/hooks/mode_preload.py
+@@ -24,17 +24,11 @@ class HookUtilModePreload(HookUtilBase):
+ @contextmanager
+ def configure_subprocess():
+     """Configure environment variables for subprocesses. Only needed for hook_mode=preload."""
+-    # Currently, torch_memory_saver does not support preload for npu, therefore LD_PRELOAD interception is not implemented.
+-    if hasattr(torch, "npu") and torch.npu.is_available():
++    with _change_env(
++        "LD_PRELOAD",
++        str(get_binary_path_from_package("torch_memory_saver_hook_mode_preload")),
++    ):
+         yield
+-        return
+-
+-    else:
+-        with _change_env(
+-            "LD_PRELOAD",
+-            str(get_binary_path_from_package("torch_memory_saver_hook_mode_preload")),
+-        ):
+-            yield
+ 
+ 
+ @contextmanager
+diff --git a/contrib/torch_memory_saver/test/cuda_graph.py b/contrib/torch_memory_saver/test/cuda_graph.py
+new file mode 100644
+index 0000000..9067683
+--- /dev/null
++++ b/contrib/torch_memory_saver/test/cuda_graph.py
+@@ -0,0 +1,152 @@
++import logging
++import os
++import sys
++import time
++from typing import Callable
++
++import torch
++from torch_memory_saver import torch_memory_saver
++from torch_memory_saver.testing_utils import get_and_print_npu_memory
++
++logging.basicConfig(level=logging.DEBUG, stream=sys.stdout)
++
++dummy_tensor_size = (
++    5,
++    100_000_000,
++)
++cuda_graph_intermediate_tensor_size = (1_000_000_000,)
++
++
++def _ptr(x):
++    assert isinstance(x, torch.Tensor)
++    return hex(x.data_ptr())
++
++
++class KVCache:
++    def __init__(self):
++        self.create_buffers(1)
++
++    def create_buffers(self, value):
++        with torch_memory_saver.region(tag="kv_cache"):
++            # or model weights, etc
++            self.kv_buffer = torch.full(
++                dummy_tensor_size, value, dtype=torch.float32, device="npu"
++            )
++        print(f"create_buffers {_ptr(self.kv_buffer)=}")
++
++    def clear_buffers(self):
++        del self.kv_buffer
++
++    def execute(self, arg: torch.Tensor) -> torch.Tensor:
++        # print(f'KVCache.execute {arg=} {self.kv_buffer=}')
++        ans_value = (arg + self.kv_buffer.mean(dim=1)).mean()
++        big_intermediate_tensor = (
++            torch.ones(cuda_graph_intermediate_tensor_size, device="npu") * ans_value
++        ).mean()
++        return big_intermediate_tensor
++
++
++def create_cuda_graph(fn: Callable, hook_mode):
++    # warmup
++    s = torch.npu.Stream()
++    s.wait_stream(torch.npu.current_stream())
++    with torch.npu.stream(s):
++        print("with torch.npu.stream(s) execute fn")
++        fn()
++    torch.npu.current_stream().wait_stream(s)
++
++    # capture
++    g = torch.npu.NPUGraph()
++    ctx = (
++        torch_memory_saver.cuda_graph(g, tag="graph")
++        if hook_mode == "preload"
++        else torch.npu.graph(g)
++    )
++    with ctx:
++        print("with torch.npu.graph(g) execute fn")
++        fn()
++
++    return g
++
++
++def run(hook_mode: str):
++    torch_memory_saver.hook_mode = hook_mode
++    logging.basicConfig(level=logging.DEBUG, stream=sys.stdout)
++
++    cache = KVCache()
++    static_input = torch.zeros((5,), dtype=torch.float32, device="npu")
++    static_output = torch.zeros((5,), dtype=torch.float32, device="npu")
++    print(f"{_ptr(static_input)=} {_ptr(static_output)=}")
++
++    def fn():
++        nonlocal static_output
++        static_output = cache.execute(static_input)
++
++    g = create_cuda_graph(fn, hook_mode=hook_mode)
++
++    print("replay #1")
++    static_input[...] = 100
++    g.replay()
++    print(f"{static_output=}")
++    assert static_output == 101, f"{static_output=}"
++
++    print("torch.npu.empty_cache()")
++    torch.npu.empty_cache()
++
++    print("sleep...")
++    time.sleep(1)
++
++    mem_before_pause = get_and_print_npu_memory("Before pause")
++
++    print('call memory_saver.pause("kv_cache")')
++    torch_memory_saver.pause("kv_cache")
++    print("sleep...")
++    time.sleep(1)
++
++    mem_after_pause_kv_cache = get_and_print_npu_memory("After pause kv_cache")
++    assert mem_before_pause - mem_after_pause_kv_cache > 400_000_000
++
++    if hook_mode == "preload":
++        print('call memory_saver.pause("graph")')
++        torch_memory_saver.pause("graph")
++        print("sleep...")
++        time.sleep(1)
++
++        mem_after_pause_graph = get_and_print_npu_memory("After pause graph")
++        assert mem_after_pause_kv_cache - mem_after_pause_graph > 3_000_000_000
++
++    print("when kv cache is released, we can allocate *other* big tensors")
++    other_big_tensor = torch.zeros((2500_000_000,), dtype=torch.uint8, device="npu")
++    print("sleep...")
++    time.sleep(1)
++    print(f"{other_big_tensor=}")
++    del other_big_tensor
++    torch.npu.empty_cache()
++    print("sleep...")
++    time.sleep(1)
++
++    if hook_mode == "preload":
++        print('call memory_saver.resume("graph")')
++        torch_memory_saver.resume("graph")
++    print('call memory_saver.resume("kv_cache")')
++    torch_memory_saver.resume("kv_cache")
++
++    dummy = torch.zeros((3,), device="npu")
++    print(f"{_ptr(dummy)=}")
++
++    cache.kv_buffer[...] = 2
++
++    print("replay #2")
++    static_input[...] = 200
++    g.replay()
++    print(f"{static_output=}")
++    assert static_output == 202, f"{static_output=}"
++
++    print("sleep...")
++    time.sleep(1)
++
++    print(f"{dummy=}")
++
++
++if __name__ == "__main__":
++    run(hook_mode=sys.argv[1])
+diff --git a/contrib/torch_memory_saver/test/multi_device.py b/contrib/torch_memory_saver/test/multi_device.py
+index 7830bad..3ebda87 100644
+--- a/contrib/torch_memory_saver/test/multi_device.py
++++ b/contrib/torch_memory_saver/test/multi_device.py
+@@ -17,17 +17,14 @@ def run(hook_mode: str):
+ 
+     with torch_memory_saver.region():
+         dev0_a = torch.full((100_000_000,), 10, dtype=torch.uint8, device="npu:0")
+-    torch.npu.synchronize()
+     checker.check_and_update("alloc dev0_a", min_delta=(80_000_000, 0))
+ 
+     with torch_memory_saver.region():
+         dev1_a = torch.full((100_000_000,), 10, dtype=torch.uint8, device="npu")
+-    torch.npu.synchronize()
+     checker.check_and_update("alloc dev1_a", min_delta=(0, 80_000_000))
+ 
+     with torch_memory_saver.region():
+         dev1_b = torch.full((100_000_000,), 10, dtype=torch.uint8, device="npu:1")
+-    torch.npu.synchronize()
+     checker.check_and_update("alloc dev1_b", min_delta=(0, 80_000_000))
+ 
+     torch_memory_saver.pause()
+diff --git a/contrib/torch_memory_saver/test/rl_example.py b/contrib/torch_memory_saver/test/rl_example.py
+index f93922f..ff885a6 100644
+--- a/contrib/torch_memory_saver/test/rl_example.py
++++ b/contrib/torch_memory_saver/test/rl_example.py
+@@ -3,7 +3,7 @@ This example demonstrates the core functionalities of torch_memory_saver, and th
+ as a short tutorial for readers who want to understand the library. It validates how virtual addresses
+ remain unchanged while physical memory is released during pause and reallocated upon resume, illustrating the
+ mechanisms of pausing and resuming memory regions, the implications for data consistency, and the preservation
+-of functional integrity for tensor operations and CUDA graphs.
++of functional integrity for tensor operations and NPU graphs.
+ """
+ 
+ import logging
+@@ -29,7 +29,7 @@ def _ptr(x):
+     Get the virtual address of a tensor.
+ 
+     Virtual Address is the address that the process sees, not the actual physical memory address.
+-    It needs to be mapped to actual NPU physical memory through the CUDA driver.
++    It needs to be mapped to actual NPU physical memory through the CANN driver.
+     In torch_memory_saver, this virtual address remains unchanged during pause/resume operations.
+     """
+     assert isinstance(x, torch.Tensor)
+@@ -108,15 +108,14 @@ class KVCache:
+         return (arg + self.kv_buffer.mean(dim=1)).mean()
+ 
+ 
+-# https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/
+-def create_cuda_graph(fn: Callable):
++def create_npu_graph(fn: Callable):
+     """
+-    Create CUDA graph for validating the impact of memory management on CUDA graphs.
++    Create NPU graph for validating the impact of memory management on NPU graphs.
+ 
+     Validation objectives:
+-    1. Whether CUDA graphs can still work normally after pause/resume.
+-    2. The importance of virtual address remaining unchanged for CUDA graphs.
+-    3. CUDA graphs can still execute correctly even when physical memory is reallocated.
++    1. Whether NPU graphs can still work normally after pause/resume.
++    2. The importance of virtual address remaining unchanged for NPU graphs.
++    3. NPU graphs can still execute correctly even when physical memory is reallocated.
+     """
+     s = torch.npu.Stream()
+     s.wait_stream(torch.npu.current_stream())
+@@ -145,7 +144,7 @@ def run(hook_mode: str):
+        - Disconnect the mapping from virtual address to physical memory.
+        - Release physical memory back to NPU memory pool.
+        - Keep virtual address unchanged.
+-       - Accessing paused tensors will cause CUDA errors.
++       - Accessing paused tensors will cause CANN errors.
+ 
+     3. Resume mechanism.
+        - Allocate new physical memory from NPU memory pool.
+@@ -160,7 +159,7 @@ def run(hook_mode: str):
+ 
+     5. Functional integrity.
+        - Tensor operations can still work normally even when physical memory is reallocated.
+-       - CUDA graphs can still execute correctly (because virtual address remains unchanged).
++       - NPU graphs can still execute correctly (because virtual address remains unchanged).
+        - Selective pause/resume functionality works normally.
+     """
+ 
+@@ -175,28 +174,28 @@ def run(hook_mode: str):
+         f"Original addresses - KV cache: {original_kv_cache_ptr}, Model weights: {original_model_weights_ptr}"
+     )
+ 
+-    # Create static input/output tensors for CUDA graphs
++    # Create static input/output tensors for NPU graphs
+     # These tensors are not managed by torch_memory_saver, addresses will change normally
+     static_input = torch.zeros((20_480,), dtype=torch.float32, device="npu")
+     static_output = torch.zeros((), dtype=torch.float32, device="npu")
+ 
+     def fn():
+-        """Function executed in CUDA graph: combine KV cache and model computation"""
++        """Function executed in NPU graph: combine KV cache and model computation"""
+         nonlocal static_output
+         kv_output = cache.execute(static_input[:5])
+         model_output = model.forward(static_input)
+         static_output = kv_output + model_output
+ 
+-    # Create CUDA graph
+-    g = create_cuda_graph(fn)
++    # Create NPU graph
++    g = create_npu_graph(fn)
+ 
+-    # First execution of CUDA graph
++    # First execution of NPU graph
+     static_input[...] = 100
+     g.replay()
+     print(f"First execution result: {static_output.item()}")
+     if static_output != 2048101:
+         raise ValueError(f"Expected 2048101, got {static_output}")
+-    print("✓ CUDA graph first execution passed!")
++    print("✓ NPU graph first execution passed!")
+ 
+     time.sleep(1)
+ 
+@@ -244,15 +243,15 @@ def run(hook_mode: str):
+     with torch.no_grad():
+         model.linear.weight[...] = 2
+ 
+-    # Second execution of CUDA graph, validate functional integrity
+-    # Even when physical memory is reallocated, CUDA graph can still work normally
+-    # This is because virtual address remains unchanged, addresses recorded in CUDA graph are still valid
++    # Second execution of NPU graph, validate functional integrity
++    # Even when physical memory is reallocated, NPU graph can still work normally
++    # This is because virtual address remains unchanged, addresses recorded in NPU graph are still valid
+     static_input[...] = 200
+     g.replay()
+     print(f"Second execution result: {static_output.item()}")
+     if static_output != 8192202:
+         raise ValueError(f"Expected 8192202, got {static_output}")
+-    print("✓ CUDA graph second execution passed!")
++    print("✓ NPU graph second execution passed!")
+ 
+     time.sleep(1)
+ 
+diff --git a/contrib/torch_memory_saver/test/simple.py b/contrib/torch_memory_saver/test/simple.py
+index 90d52e9..fafdf47 100644
+--- a/contrib/torch_memory_saver/test/simple.py
++++ b/contrib/torch_memory_saver/test/simple.py
+@@ -15,7 +15,6 @@ def run(hook_mode: str):
+         pauseable_tensor = torch.full(
+             (1_000_000_000,), 100, dtype=torch.uint8, device="npu"
+         )
+-    torch.npu.synchronize()
+     original_address = pauseable_tensor.data_ptr()
+     print(f"Pauseable tensor virtual address: 0x{original_address:x}")
+     print(f"{normal_tensor=} {pauseable_tensor=}")
+@@ -44,7 +43,6 @@ def run(hook_mode: str):
+ 
+     print("sleep...")
+     time.sleep(1)
+-    torch.npu.synchronize()
+     print(f"{normal_tensor=} {pauseable_tensor=}")
+ 
+     get_and_print_npu_memory("Before empty cache")
+@@ -56,7 +54,6 @@ def run(hook_mode: str):
+     get_and_print_npu_memory("Before empty cache (tensor deleted)")
+     torch.npu.empty_cache()
+     get_and_print_npu_memory("After empty cache (tensor deleted)")
+-    torch.npu.synchronize()
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/contrib/torch_memory_saver/test/test_disable_releases_pool.py b/contrib/torch_memory_saver/test/test_disable_releases_pool.py
+new file mode 100644
+index 0000000..c7d760d
+--- /dev/null
++++ b/contrib/torch_memory_saver/test/test_disable_releases_pool.py
+@@ -0,0 +1,121 @@
++"""Verify the fix: tms.disable() context now releases its MemPool back to the
++driver on exit, instead of leaking it until the next wake_up + empty_cache.
++
++Mirrors the behavior of the GPU version of torch_memory_saver. Before the fix,
++NPU's behavior was inconsistent (memory allocated inside disable() stayed
++reserved until empty_cache() was called externally).
++"""
++
++import logging
++import os
++import sys
++
++import torch
++from torch_memory_saver import torch_memory_saver
++from torch_memory_saver.testing_utils import get_and_print_npu_memory
++
++
++def run(hook_mode: str):
++    assert os.environ["TMS_INIT_ENABLE"] == "1"
++    assert os.environ["TMS_INIT_ENABLE_CPU_BACKUP"] == "1"
++    assert hook_mode == "preload"
++
++    torch_memory_saver.hook_mode = hook_mode
++    logging.basicConfig(level=logging.DEBUG, stream=sys.stdout)
++
++    # Touch NPU once to materialise the runtime / default streams so they don't
++    # skew the baseline measurement.
++    _ = torch.full((1_000_000,), 42, dtype=torch.uint8, device="npu")
++    mem_initial = get_and_print_npu_memory("Init (baseline)")
++
++    # Simulate the Relax weight-update pattern: model weights live in the
++    # tms-managed region, then we want to do a big all-gather inside disable().
++    # Keep allocations modest so the test fits even on a busy device.
++    MODEL_BYTES = 128 * 1024 ** 2  # 128 MiB per weight
++    TEMP_BYTES = 512 * 1024 ** 2   # 512 MiB temp buffer in disable()
++
++    model_weights = [
++        torch.full((MODEL_BYTES,), 42, dtype=torch.uint8, device="npu")
++        for _ in range(2)  # ~256 MiB of "model weights" (in tms region)
++    ]
++    # Touch each weight (no temporary allocations) so kernels are scheduled.
++    for w in model_weights:
++        _ = w[:1024].sum().item()
++    torch.npu.synchronize()
++    mem_after_model = get_and_print_npu_memory("After model alloc (in tms region)")
++    assert mem_after_model > mem_initial + MODEL_BYTES, (
++        f"model alloc did not raise memory: {mem_after_model/1024**3:.2f} GB"
++    )
++
++    # Sleep: move the model to CPU
++    torch_memory_saver.pause()
++    mem_after_pause = get_and_print_npu_memory("After tms.pause()")
++    # paused → only the baseline + caching allocator metadata remains
++    assert mem_after_pause < mem_initial + 200 * 1024 ** 2, (
++        f"pause did not release physical memory: {mem_after_pause/1024**3:.2f} GB"
++    )
++
++    # Mimic the "update_weights inside disable()" flow used by Relax:
++    # allocate a big temporary buffer (like all_gather output), then release it.
++    with torch_memory_saver.disable():
++        mem_in_disable_start = get_and_print_npu_memory(
++            "Inside disable() before alloc"
++        )
++        # Big temporary tensor — this is the analogue of the all_gather buffer
++        # that used to leak ~8 GiB in the Relax 9B run.
++        big_buf = torch.full(
++            (TEMP_BYTES,), 99, dtype=torch.uint8, device="npu"
++        )
++        # Touch a small slice to make sure it's really mapped (avoid summing
++        # the whole 2 GiB which would be slow and could overflow).
++        out = big_buf[:1024].sum().item()
++        assert out == 99 * 1024, f"big_buf checksum mismatch: {out}"
++
++        mem_in_disable_peak = get_and_print_npu_memory(
++            "Inside disable() at peak (512 MiB temp)"
++        )
++        assert mem_in_disable_peak > mem_in_disable_start + TEMP_BYTES * 0.9, (
++            f"temp buf did not raise memory: peak={mem_in_disable_peak/1024**3:.2f} GB "
++            f"vs start={mem_in_disable_start/1024**3:.2f} GB"
++        )
++
++        # Drop the reference -- but in the OLD behavior the MemPool still held
++        # the 2 GiB until empty_cache() was called externally.
++        del big_buf
++
++    # ★★★ Key assertion: after exiting disable(), the 4 GiB should be released. ★★★
++    mem_after_exit_disable = get_and_print_npu_memory("After exiting disable()")
++
++    expected_max = mem_after_pause + 200 * 1024 ** 2  # allow 200 MiB slack
++    leaked = mem_after_exit_disable - mem_after_pause
++    print(
++        f"\nLeak check: mem_after_exit_disable={mem_after_exit_disable/1024**3:.2f} GB "
++        f"vs mem_after_pause={mem_after_pause/1024**3:.2f} GB "
++        f"(diff={leaked/1024**3:.2f} GB, allowed slack=0.20 GB)"
++    )
++    assert mem_after_exit_disable <= expected_max, (
++        f"FAIL: disable() leaked memory!\n"
++        f"  before disable (paused): {mem_after_pause / 1024**3:.2f} GB\n"
++        f"  after exiting disable:   {mem_after_exit_disable / 1024**3:.2f} GB\n"
++        f"  leaked:                  {leaked / 1024**3:.2f} GB\n"
++        f"  expected leak:           < 0.20 GB"
++    )
++    print("✅ PASS: disable() correctly released its MemPool on exit")
++
++    # And resume should still work normally
++    torch_memory_saver.resume()
++    mem_after_resume = get_and_print_npu_memory("After tms.resume()")
++    assert mem_after_resume > mem_after_exit_disable + MODEL_BYTES * 0.9, (
++        f"resume did not restore model weights: "
++        f"{mem_after_resume/1024**3:.2f} GB vs {mem_after_exit_disable/1024**3:.2f} GB"
++    )
++
++    # Sanity: model weights are still intact
++    for i, w in enumerate(model_weights):
++        s = w[:1024].sum().item()
++        assert s == 42 * 1024, f"weight {i} corrupted after disable+resume: {s}"
++    print("✅ PASS: model weights survived disable() round-trip")
++
++
++if __name__ == "__main__":
++    run(hook_mode=sys.argv[1])
+diff --git a/contrib/torch_memory_saver/test/training_engine.py b/contrib/torch_memory_saver/test/training_engine.py
+new file mode 100644
+index 0000000..d3eaa00
+--- /dev/null
++++ b/contrib/torch_memory_saver/test/training_engine.py
+@@ -0,0 +1,96 @@
++import logging
++import os
++import sys
++from functools import reduce
++from typing import List
++
++import torch
++from torch_memory_saver import torch_memory_saver
++from torch_memory_saver.testing_utils import get_and_print_npu_memory
++
++
++def run(hook_mode: str):
++    assert os.environ["TMS_INIT_ENABLE"] == "1"
++    assert os.environ["TMS_INIT_ENABLE_CPU_BACKUP"] == "1"
++    assert hook_mode == "preload"
++
++    torch_memory_saver.hook_mode = hook_mode
++    logging.basicConfig(level=logging.DEBUG, stream=sys.stdout)
++
++    initial_tensor = torch.full((1_000_000,), 42, dtype=torch.uint8, device="npu")
++    mem_initial = get_and_print_npu_memory("Init")
++
++    model_weights = [
++        torch.full((size,), 42, dtype=torch.uint8, device="npu")
++        for size in [1024**3, 1024**2, 1024**1, 42]
++    ]
++
++    _execute_forward_pass_and_assert(model_weights)
++    mem_after_forward_pass = get_and_print_npu_memory("After forward pass")
++    assert mem_after_forward_pass > mem_initial + 5 * 1024**3
++
++    torch_memory_saver.pause()
++    mem_after_pause = get_and_print_npu_memory("After pause")
++    assert mem_after_pause < mem_initial + 200 * 1024**2
++
++    with torch_memory_saver.disable():
++        mem_after_disable = get_and_print_npu_memory("After disable")
++        assert mem_after_disable == mem_after_pause
++
++        # Can still execute code in disabled region
++        tensor_in_disabled_region = torch.full(
++            (1024**3,), 53, dtype=torch.uint8, device="npu"
++        )
++        out = tensor_in_disabled_region.float().mean().item()
++        assert out == 53, f"{out=}"
++
++        mem_after_exec_in_disable = get_and_print_npu_memory("After exec in disable")
++        assert mem_after_exec_in_disable > mem_after_disable + 4 * 1024**3
++
++        del tensor_in_disabled_region
++    torch_memory_saver.resume()
++    torch.npu.empty_cache()
++    torch_memory_saver.pause()
++    """
++    Currently, the behavior in this scenario is inconsistent with the GPU version of                                        torch_memory_saver. The NPU memory allocated within the disable() context is not                                        released immediately; it will only be freed when torch.npu.empty_cache() is invoked.
++    Additionally, since empty_cache() takes effect for all memory pools, it is not                                          recommended to invoke it in the paused state, as this may corrupt the address
++    spaces that have already been paused.
++
++    Expected (GPU): mem_after_exit_disable <= mem_after_pause + 10 * 1024 ** 2
++    NPU Current: mem_after_exit_disable == mem_after_exec_in_disable
++    """
++    mem_after_exit_disable = get_and_print_npu_memory("After exiting disable")
++    assert mem_after_exit_disable == mem_after_exec_in_disable
++
++    torch_memory_saver.resume()
++    mem_after_resume = get_and_print_npu_memory("After resume")
++    delta_expect = mem_after_forward_pass - mem_after_pause
++    delta_actual = mem_after_resume - mem_after_exit_disable
++    assert delta_expect - 50 * 1024**2 < delta_actual < delta_expect + 50 * 1024**2
++
++    _execute_forward_pass_and_assert(model_weights)
++    mem_after_second_forward_pass = get_and_print_npu_memory(
++        "After second forward pass"
++    )
++    assert (
++        mem_after_resume - 1024**2
++        < mem_after_second_forward_pass
++        < mem_after_resume + 1024**2
++    )
++
++    del initial_tensor
++
++
++def _execute_forward_pass_and_assert(weights: List[torch.Tensor]):
++    # simulate large activations during forward pass
++    ones = torch.ones((1024**3,), dtype=torch.float32, device="npu")
++    sum_avg_weights = reduce(
++        lambda a, b: (a + b) / 2, [w.float().mean() for w in weights]
++    )
++    outs = ones * sum_avg_weights
++    out = outs.mean().item()
++    assert out == 42, f"{out=}"
++
++
++if __name__ == "__main__":
++    run(hook_mode=sys.argv[1])
+-- 
+2.34.1

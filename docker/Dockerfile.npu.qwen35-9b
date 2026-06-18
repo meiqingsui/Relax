@@ -1,0 +1,83 @@
+#
+FROM quay.io/ascend/vllm-ascend:v0.18.0-a3
+
+COPY ./docker/npu_patch /workspace/patch
+COPY . /workspace/Relax
+WORKDIR /workspace
+ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+
+RUN sed -i 's/archive.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list && \
+    sed -i 's/security.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \
+    build-essential patchelf tmux net-tools htop nano iputils-ping \
+    autoconf automake libatlas-base-dev libgoogle-glog-dev libbz2-dev libc-ares2 \
+    libleveldb-dev liblmdb-dev libprotobuf-dev libsnappy-dev libtool nasm protobuf-compiler pkg-config unzip sox \
+    libsndfile1 libpng-dev libhdf5-dev gfortran rapidjson-dev ninja-build libedit-dev rsync
+
+RUN apt-get install -y locales tzdata && \
+    locale-gen "$LANG" && update-locale LANG="$LANG" LC_ALL="$LC_ALL" && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+RUN apt-get install -y --no-install-recommends \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip config set global.index-url ${PIP_INDEX_URL} && \
+    git config --global http.sslverify false && \
+    git config --global http.postBuffer 2147483648
+
+RUN git clone https://gitcode.com/Ascend/MindSpeed.git /workspace/MindSpeed && \
+    git clone https://github.com/NVIDIA/Megatron-LM.git /workspace/Megatron-LM && \
+    git clone https://github.com/coding-famer/Megatron-Bridge-slime.git /workspace/Megatron-Bridge && \
+    cp -rf /workspace/MindSpeed/mindspeed/ops/triton /workspace
+
+RUN cd /workspace/MindSpeed && git checkout fc63de5c && pip install -r requirements.txt && pip install -e . && \
+    cd /workspace/Megatron-LM  && git checkout 3714d81d4 && pip install -e . && \
+    cd /workspace/Megatron-Bridge && git checkout qwen35 && \
+    mv /workspace/triton /workspace/MindSpeed/mindspeed/ops
+
+RUN git clone https://github.com/sgl-project/sgl-kernel-npu.git /workspace/sgl-kernel-npu && \
+    git clone https://github.com/sgl-project/sglang.git /workspace/sglang
+
+RUN git clone https://gitcode.com/Ascend/pytorch.git /workspace/pytorch && \
+    cd /workspace/pytorch && git checkout v2.9.0-7.3.0 && bash ci/build.sh --python=3.11 && \
+    pip install /workspace/pytorch/dist/torch_npu*_aarch64.whl
+
+RUN cd /workspace/sglang/python && \
+    git fetch origin pull/23815/head:pr-23815 && \
+    git checkout pr-23815 && \
+    rm -rf pyproject.toml && \
+    mv pyproject_npu.toml pyproject.toml && \
+    pip install -v -e .[all_npu]
+
+RUN cd /workspace/sgl-kernel-npu && \
+    git checkout 2026.04.15.rc3 && \
+    bash build.sh && \
+    pip install output/*.whl
+
+RUN cd /workspace/Relax && pip install -r requirements.txt && pip install -e .
+
+RUN pip install --no-cache-dir tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
+    pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git" --no-deps -i https://pypi.tuna.tsinghua.edu.cn/simple && \
+    pip install nvidia-modelopt && \
+    pip install setuptools==79.0.1 fla-core flash-linear-attention && \
+    cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -sf deep_ep/deep_ep_cpp*.so
+
+RUN cd /workspace/MindSpeed && \
+    patch -p1 < /workspace/patch/mindspeed-9b.patch && \
+    cd /workspace/Megatron-Bridge && \
+    patch -p1 < /workspace/patch/megatron-bridge-9b.patch && \
+    cd /workspace/Megatron-LM && \
+    patch -p1 < /workspace/patch/megatron-lm-9b.patch && \
+    cd /workspace/sgl-kernel-npu && \
+    patch -p1 < /workspace/patch/sgl-kernel-npu-9b.patch && \
+    rm -rf /workspace/patch
+
+ENV PYTHONPATH=/workspace/Megatron-Bridge/src:/workspace/MindSpeed:/workspace/Megatron-LM:$PYTHONPATH
+
+CMD ["/bin/bash"]

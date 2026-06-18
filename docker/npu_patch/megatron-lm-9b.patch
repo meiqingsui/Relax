@@ -1,0 +1,24 @@
+diff --git a/megatron/core/ssm/gated_delta_net.py b/megatron/core/ssm/gated_delta_net.py
+index dfa6e4c35..11d838286 100644
+--- a/megatron/core/ssm/gated_delta_net.py
++++ b/megatron/core/ssm/gated_delta_net.py
+@@ -37,8 +37,8 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
+ # from .gated_delta_net_context_parallel import GatedDeltaNetContextParallel
+ 
+ try:
+-    from fla.modules.l2norm import l2norm
+-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
++    from mindspeed.ops.triton.l2norm import l2norm
++    from mindspeed.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
+ 
+     HAVE_FLA = True
+ except ImportError:
+@@ -372,7 +372,7 @@ class GatedDeltaNet(MegatronModule):
+         nvtx_range_pop(suffix="g_and_beta")
+ 
+         nvtx_range_push(suffix="gated_delta_rule")
+-        if self.config.deterministic_mode:
++        if not HAVE_FLA:
+             core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
+                 query,
+                 key,

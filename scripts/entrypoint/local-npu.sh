@@ -57,9 +57,9 @@ set -x
 unset MASTER_ADDR 2>/dev/null || true
 export PYTHONUNBUFFERED=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export MEGATRON=${MEGATRON:-/root/Megatron-LM/}
-export MEGATRON_BRIDGE_SRC=${MEGATRON_BRIDGE_SRC:-/root/Megatron-Bridge/src/}
-export MINDSPEED=${MINDSPEED:-/root/MindSpeed/}
+export MEGATRON=${MEGATRON:-/workspace/Megatron-LM/}
+export MEGATRON_BRIDGE_SRC=${MEGATRON_BRIDGE_SRC:-/workspace/Megatron-Bridge/src/}
+export MINDSPEED=${MINDSPEED:-/workspace/MindSpeed/}
 export RELAX=${RELAX:-${_LOCAL_SH_DIR}/../../}
 export PYTHONPATH=${RELAX}:${MEGATRON_BRIDGE_SRC}:${MINDSPEED}:$MEGATRON:$RELAX:${PYTHONPATH:-}
 export MODEL_CONFIG_DIR="${_LOCAL_SH_DIR}/../models"
