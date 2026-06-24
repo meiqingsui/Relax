@@ -56,7 +56,7 @@ ROLLOUT_ARGS=(
    --n-samples-per-prompt 8
    --rollout-max-response-len 8192
    --rollout-temperature 0.8
-   --global-batch-size 128
+   --global-batch-size 256
    --balance-data
 )
 
@@ -107,6 +107,7 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
+   --use-tensorboard
    --use-metrics-service
    --tb-project-name  ${PROJECT_NAME}
    --tb-experiment-name qwen3-4b-GRPO-gpu4-async-${now}

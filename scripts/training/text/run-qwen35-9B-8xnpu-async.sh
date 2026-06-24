@@ -2,10 +2,10 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-4B 4xGPU fully async training script.
+# Qwen3.5-9B 8xGPU fully async training script.
 #
 # Usage:
-#   NUM_GPUS=4 bash scripts/training/text/run-qwen3-4B-4xgpu-async.sh
+#   bash scripts/training/text/run-qwen35-9B-8xnpu-async.sh
 
 set -ex
 set -o pipefail
@@ -13,11 +13,9 @@ set -o pipefail
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
 export ASCEND_COREDUMP_SIGNAL=none
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export HCCL_HOST_SOCKET_PORT_RANGE=63000-63050
 export HCCL_NPU_SOCKET_PORT_RANGE=64000-64050
-export TMS_HOOK_MODE="preload"
-export HYDRA_FULL_ERROR=1
 
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -37,9 +35,10 @@ CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3.5-9B/
    --ref-load ${MODEL_DIR}/Qwen3.5-9B/
    --megatron-to-hf-mode bridge
-   --load ${EXP_DIR}/Qwen3.5-9B_mcore_4xnpu/
-   --save ${EXP_DIR}/Qwen3.5-9B_mcore_4xnpu/
+   --load ${EXP_DIR}/Qwen3.5-9B_mcore_8xnpu/
+   --save ${EXP_DIR}/Qwen3.5-9B_mcore_8xnpu/
    --save-interval 50
+   --max-actor-ckpt-to-keep 1
 )
 
 PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
@@ -61,10 +60,12 @@ ROLLOUT_ARGS=(
 )
 
 EVAL_ARGS=(
+   --log-passrate
+   --skip-eval-before-train
    --eval-interval 20
    --eval-prompt-data aime ${EXP_DIR}/aime-2024/aime-2024.jsonl
-   --n-samples-per-eval-prompt 1
-   --eval-max-response-len 16384
+   --n-samples-per-eval-prompt 8
+   --eval-max-response-len 8192
    --eval-top-p 0.7
 )
 
@@ -82,14 +83,14 @@ PERF_ARGS=(
    # Packing is not supported for GDN currently
    --qkv-format bshd
    --micro-batch-size 1
-   --max-tokens-per-gpu 20480
+   --max-tokens-per-gpu 10240
    --no-rope-fusion
    --no-gradient-accumulation-fusion
 )
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   --use-kl-loss
+   # --use-kl-loss
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
@@ -110,21 +111,10 @@ OPTIMIZER_ARGS=(
    --use-precision-aware-optimizer
 )
 
-WANDB_ARGS=(
-   --use-tensorboard
-   --use-metrics-service
-   --tb-project-name  ${PROJECT_NAME}
-   --tb-experiment-name qwen35-9B-GRPO-4x-sync-${now}
-   # --use-wandb
-   # --wandb-project slime-dev
-   # --wandb-group qwen3-4B-test
-   # --wandb-key ${WANDB_KEY}
-)
-
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 4
-   --sglang-mem-fraction-static 0.8
-   --sglang-cuda-graph-bs 4 8 16 32 64 128 192 256
+   --sglang-mem-fraction-static 0.7
+   --sglang-cuda-graph-bs 4 8 16 32 64 128 192 $(seq 256 32 512)
    --sglang-device npu
    --sglang-disable-radix-cache
    --sglang-chunked-prefill-size 8192
@@ -133,6 +123,15 @@ SGLANG_ARGS=(
    --sglang-enable-dp-lm-head
    --sglang-attention-backend ascend
 )
+
+WANDB_ARGS=(
+   --use-tensorboard
+   --use-clearml
+   --use-metrics-service
+   --tb-project-name  ${PROJECT_NAME}
+   --tb-experiment-name qwen35-9B-GRPO-4x-sync-${now}
+)
+
 
 MISC_ARGS=(
    # default dropout in megatron is 0.1
@@ -151,10 +150,12 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 4], "rollout": [1, 4]}'\
-   --max-staleness 0 \
+   --resource '{"actor": [1, 4], "rollout": [1, 4], "advantages": [1, 0]}'\
+   --max-staleness 2 \
    --num-data-storage-units 1 \
-   --colocate \
+   --num-iters-per-train-update 32 \
+   --ref-actor-config '{"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1, "expert_model_parallel_size": 1, "max_tokens_per_gpu": 10240, "sequence_parallel": false, "only_load_weight": true}' \
+   --fully-async \
     --use-health-check \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \
@@ -165,4 +166,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     "${PERF_ARGS[@]}" \
     "${EVAL_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \
-    "${MISC_ARGS[@]}" 2>&1 | tee log/qwen35-9B-GRPO-npu4-colocate-${now}.log
+    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9B-GRPO-npu8-async-${now}.log
