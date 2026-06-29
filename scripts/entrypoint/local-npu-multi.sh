@@ -66,7 +66,7 @@ export MODEL_CONFIG_DIR="${_LOCAL_SH_DIR}/../models"
 
 # ── Ray cluster startup (single node) ──────────────────────────────────────
 export MASTER_ADDR=${MASTER_ADDR:-"80.5.25.115"}
-export SOCKET_IFNAME="enp48s3u1u1"
+export SOCKET_IFNAME=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
 CURRENT_IP=$(ifconfig $SOCKET_IFNAME | grep -Eo 'inet (addr:)?([0-9]{1,3}\.){3}[0-9]{1,3}' | awk '{print $NF}')
 NUM_GPUS="${NUM_GPUS:-16}"
 NNODES="${WORLD_SIZE:-2}"
