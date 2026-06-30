@@ -1369,7 +1369,10 @@ class MegatronTrainRayActor(TrainRayActor):
         # paused model (process groups + tms) so save can issue collectives and
         # touch GPU tensors.
         if self.args.offload_train and self._per_step_rollout:
-            reload_process_groups()
+            if device_utils.is_npu_available:
+                reload_process_groups()
+            else:
+                self.wake_up()
 
         if self.args.async_save:
             from megatron.training.async_utils import maybe_finalize_async_save
@@ -1392,7 +1395,10 @@ class MegatronTrainRayActor(TrainRayActor):
             save_hf_model(self.args, rollout_id, self.model)
 
         if self.args.offload_train and self._per_step_rollout:
-            destroy_process_groups()
+            if device_utils.is_npu_available:
+                destroy_process_groups()
+            else:
+                self.sleep()
 
         telemetry.mark_save_end(rollout_id, role=self.role)
 
@@ -1455,7 +1461,7 @@ class MegatronTrainRayActor(TrainRayActor):
         ):
             print_memory("before update_weights")
             self.weight_updater.update_weights()
-            print_memory("after update_weights")
+            print_memory("after update_weights", clear_before_print=not device_utils.is_npu_available)
 
             if self.args.ci_test and len(rollout_engines) > 0:
                 engine = random.choice(rollout_engines)
@@ -1627,7 +1633,7 @@ class MegatronTrainRayActor(TrainRayActor):
         print_memory("before update_weights")
         run(self.checkpoint_engine_client.init_process_groups_for_actor_fwd_ref(rollout_id))
         run(self.checkpoint_engine_client.recv_weight_fully_async())
-        print_memory("after update_weights")
+        print_memory("after update_weights", clear_before_print=not device_utils.is_npu_available)
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
