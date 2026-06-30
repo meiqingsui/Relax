@@ -79,7 +79,7 @@ RUN git clone https://gitcode.com/ascend/MindSpeed.git /root/MindSpeed && \
 RUN cd /root/MindSpeed && git checkout core_r0.16.0 && pip install -r requirements.txt && pip install -e . && \
     cd /root/Megatron-LM && git checkout core_v0.16.1 && pip install -e . --no-build-isolation && \
     cd /root/Megatron-Bridge && git checkout v0.3.1 && \
-    cd /root/MindSpeed-Bridge && pip install -r requirements.txt && bash tools/install_auto.sh
+    cd /root/MindSpeed-Bridge && git checkout 3655c07cbcc9 && pip install -r requirements.txt && bash tools/install_auto.sh
 
 # Patch Megatron-LM, MindSpeed, MindSpeed-Bridge
 RUN cd /root/MindSpeed && \
