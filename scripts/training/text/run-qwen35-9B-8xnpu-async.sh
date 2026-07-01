@@ -16,6 +16,7 @@ export ASCEND_COREDUMP_SIGNAL=none
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export HCCL_HOST_SOCKET_PORT_RANGE=63000-63050
 export HCCL_NPU_SOCKET_PORT_RANGE=64000-64050
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
