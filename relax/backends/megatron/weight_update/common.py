@@ -4,7 +4,7 @@ import inspect
 import re
 from argparse import Namespace
 from collections.abc import Iterator, Sequence
-
+from relax.utils.device import is_npu_available
 import torch
 import torch.distributed as dist
 from megatron.core import mpu
@@ -110,6 +110,8 @@ def all_gather_param(args, name: str, param: torch.nn.Parameter) -> torch.Tensor
     if "linear_fc1.weight" in name and "vision_model" not in name:
         param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
         param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
+        if is_npu_available:
+            partition_dim = 0
     # this is bug in megatron's grouped moe.
     if "linear_fc2.weight" in name and "vision_model" not in name:
         if partition_dim == 0:
