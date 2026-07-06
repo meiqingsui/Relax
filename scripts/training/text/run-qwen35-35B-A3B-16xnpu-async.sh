@@ -70,7 +70,7 @@ ROLLOUT_ARGS=(
 EVAL_ARGS=(
    --log-passrate
    --skip-eval-before-train
-   --eval-interval 2
+   --eval-interval 20
    --eval-prompt-data aime ${DATA_DIR}/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 8
    --eval-max-response-len 8192

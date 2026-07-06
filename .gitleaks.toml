@@ -101,6 +101,7 @@ paths = [
   '''\.gitleaks\.toml$''',
   '''docs/Dockerfile''',
   '''\.git/.*''',
+  '''scripts/training/.*\.sh$''',
   '''docs/\.vitepress/(dist|cache)/.*''',
   '''^log/.*''',
   '''^logs/.*''',

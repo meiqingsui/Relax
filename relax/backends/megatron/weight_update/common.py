@@ -4,13 +4,14 @@ import inspect
 import re
 from argparse import Namespace
 from collections.abc import Iterator, Sequence
-from relax.utils.device import is_npu_available
+
 import torch
 import torch.distributed as dist
 from megatron.core import mpu
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
+from relax.utils.device import is_npu_available
 from relax.utils.misc import get_hf_config
 from relax.utils.types import ParamInfo
 

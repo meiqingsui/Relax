@@ -17,7 +17,6 @@ export HCCL_SOCKET_IFNAME=enp23s0f3
 export GLOO_SOCKET_IFNAME=enp23s0f3
 export TP_SOCKET_IFNAME=enp23s0f3
 export HCCL_CONNECT_TIMEOUT=1200
-export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export RAY_DEDUP_LOGS=0
 export PYTHONBUFFERED=1
 
@@ -45,8 +44,7 @@ CKPT_ARGS=(
    --hf-checkpoint ${EXP_DIR}/Qwen3.5-35B-A3B
    --ref-load ${EXP_DIR}/Qwen3.5-35B-A3B
    --megatron-to-hf-mode bridge
-   # --load ${EXP_DIR}/Qwen3.5-9B_mcore_4xnpu/
-   # --load ${SCRIPT_DIR}/Qwen3.5-35B-A3B-save
+   # --load ${EXP_DIR}/Qwen3.5-9B_mcore_16xnpu/
    --save ${SCRIPT_DIR}/Qwen3.5-35B-A3B-save
    --save-interval 100
 )
@@ -76,7 +74,7 @@ EVAL_ARGS=(
    --eval-prompt-data aime ${EXP_DIR}/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 8
    --eval-max-response-len 8192
-   --eval-top-p 0.7
+   # --eval-top-p 0.7
 )
 
 PERF_ARGS=(
@@ -168,4 +166,3 @@ mkdir -p log
    "${EVAL_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
    "${MISC_ARGS[@]}" 2>&1 | tee log/qwen35-35B-MATH-gpu16-sync-${now}.log
-
