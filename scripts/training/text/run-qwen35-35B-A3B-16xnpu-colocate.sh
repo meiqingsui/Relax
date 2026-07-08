@@ -2,10 +2,10 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-4B 4xGPU fully async training script.
+# Qwen3.5-35B-A3B 16xNPU colocate training script.
 #
 # Usage:
-#   NUM_GPUS=4 bash scripts/training/text/run-qwen3-4B-4xgpu-async.sh
+#   bash scripts/training/text/run-qwen35-35B-A3B-16xnpu-colocate.sh
 
 set -ex
 set -o pipefail

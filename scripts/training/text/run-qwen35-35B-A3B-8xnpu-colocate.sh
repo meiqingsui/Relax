@@ -2,10 +2,10 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-30B-A3B 8xGPU colocate training script.
+# Qwen3.5-35B-A3B 8xNPU colocate training script.
 #
 # Usage:
-#   bash scripts/training/text/run-qwen3-30B-A3B-8xgpu.sh
+#   bash scripts/training/text/run-qwen35-35B-A3B-8xnpu-colocate.sh
 
 set -ex
 set -o pipefail
